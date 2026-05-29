@@ -128,19 +128,42 @@ Much of the servlet/XSS/SSRF coverage is ported from
 [0ang3el/aem-hacker](https://github.com/0ang3el/aem-hacker), re-implemented with
 this tool's auth-wall suppression, role tagging, and reporting.
 
-### Out-of-band SSRF (`--ssrf-callback`)
+### Out-of-band SSRF — Burp Collaborator (`--collaborator`)
 
-Blind SSRF in AEM's connector servlets is confirmed reliably out-of-band. Give
-the tool a tester-reachable `HOST:PORT`; it starts a local listener on `PORT`,
-tells each SSRF servlet to fetch `http://HOST:PORT/<token>/<servlet>/...`, and a
-callback proves the SSRF:
+Blind SSRF in AEM's connector servlets is confirmed out-of-band. The
+recommended way is **Burp Collaborator**: paste your Collaborator payload host
+and the tool fires one sub-domain per servlet, so a hit in the Collaborator tab
+names the vulnerable servlet:
+
+```bash
+python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080 --collaborator abc123.oastify.com
+```
+
+It probes Salesforce / Reporting / SiteCatalyst / AutoProvisioning / Opensocial
+(+ makeRequest) / linkchecker with `http://<servlet><id>.abc123.oastify.com/`.
+Then open the Collaborator tab — e.g. a DNS/HTTP hit on
+`salesforcesecret<id>.abc123.oastify.com` confirms SSRF via SalesforceSecretServlet
+(CVE-2018-5006). (The tool can't poll Collaborator for you, so it reports the
+probes fired + the sub-domain→servlet map for attribution.)
+
+Alternatively, if you have a tester-reachable IP (VPS/tunnel, not via Burp), use
+a self-hosted auto-confirming listener:
 
 ```bash
 python3 aem_hunter.py -u TARGET --ssrf-callback 1.2.3.4:8000
 ```
 
-The target must be able to reach your `HOST:PORT` (a public IP / VPS / tunnel —
-this won't work through a forward proxy like Burp).
+### Sling `resourceType` RCE
+
+Beyond package install and direct `/apps` writes, the escalation (`--exploit`)
+also tries Mikhail Egorov's **`sling:resourceType` chain** (from
+[Static-Flow/aem-rce](https://github.com/Static-Flow/aem-rce) /
+[Hacking AEM Sites](https://www.slideshare.net/0ang3el/hacking-aem-sites)):
+upload a JSP to `/content` → `:operation=copy` it to `/apps` → bind
+`sling:resourceType` → request the node so Sling executes the JSP. This lands
+RCE when `/content` is writable and the copy reaches `/apps` even if a direct
+`/apps` POST-create is blocked. It also tries the QueryBuilder
+`p.hits=selective&p.properties=rep:password` trick to pull user hashes.
 
 When you paste a Cookie header, the tool first hits
 `/libs/granite/security/currentuser.json` and prints who you authenticated as,
