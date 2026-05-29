@@ -117,8 +117,9 @@ no roles to configure, no module flags.
 | Sling POST abuse     | Arbitrary node creation, property manipulation, `:operation` and `:member` primitives             |
 | Replication          | `/etc/replication.json` and agent transport credentials                                           |
 | Source disclosure    | clientlib `.js.source` / `.source.json` quirks                                                    |
-| Servlet exposure     | GQLServlet, LoginStatusServlet (+ default-cred check), AuditLogServlet, CRXDE logs, Disk Usage     |
-| XSS                  | WCMDebugFilter (CVE-2016-7882), WCMSuggestionsServlet, reflected XSS via exposed SWF files         |
+| Servlet exposure     | GQLServlet, LoginStatusServlet (+ default-cred check), AuditLogServlet, CRXDE logs, Disk Usage, BackgroundServlet, BulkEditor, UserAdmin, Offloading, miscadmin, dumplibs, nodetypes, MergeMetadata |
+| XSS                  | ChildrenList selector, CRXDE setPreferences, WCMDebugFilter (CVE-2016-7882), WCMSuggestionsServlet, reflected XSS via SWF |
+| Nuclei path set      | ~15 detections ported from projectdiscovery/nuclei-templates AEM set + Cappricio aem-xss (exact matchers) |
 | ACS AEM Tools        | AEM Fiddle JSP-eval RCE, ACS Tools presence                                                       |
 | Deserialization      | ExternalJobServlet Java untrusted-deserialization probe (`--exploit`)                             |
 | Out-of-band SSRF     | Salesforce / Reporting / SiteCatalyst / AutoProvisioning / Opensocial via a callback listener     |

