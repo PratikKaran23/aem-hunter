@@ -1104,6 +1104,71 @@ class AEMHunter:
                              "prove end-to-end RCE (drops & removes a canary JSP) and attempt "
                              "admin-group escalation.")
 
+    def _emit_access_summary(self) -> None:
+        """Synthesize what THIS role/session actually proved — a single,
+        report-ready line so the impact is unambiguous per role."""
+        mine = [f for f in self.reporter.findings if f.role == self.role]
+        if not mine:
+            return
+        T = " || ".join(f.title for f in mine)
+        rce = "REMOTE CODE EXECUTION" in T
+        write_code = ("WRITE to CODE" in T) or ("Sling JSP" in T) or ("DavEx WRITE" in T)
+        read_repo = ("JCR read" in T) or ("Repository root readable" in T) or ("DavEx full-repo READ" in T)
+        packmgr = "Package Manager" in T
+        upload_denied = "blocked at: UPLOAD" in T
+        lateral = "Replication transport credentials" in T
+        hashes = "HASHES dumped" in T
+        users = "User enumeration" in T
+        secrets = [f for f in mine if "Secret value readable" in f.title or "secret-like values" in f.title]
+
+        caps: List[str] = []
+        if read_repo:
+            caps.append("full-repo READ (CRX DavEx)")
+        if packmgr:
+            caps.append("packmgr listing READ")
+        if secrets:
+            caps.append(f"{len(secrets)} secret(s) incl. config creds")
+        if lateral:
+            caps.append("replication creds -> lateral to PUBLISH")
+        if hashes:
+            caps.append("user password HASHES")
+        elif users:
+            caps.append("user enumeration")
+        if rce:
+            caps.append("RCE CONFIRMED")
+        elif write_code:
+            caps.append("code-space WRITE (RCE-capable)")
+        else:
+            caps.append("no write/RCE for this role")
+
+        if rce or write_code:
+            sev = SEV_CRITICAL
+            verdict = "this role reaches code execution"
+        elif lateral or hashes:
+            sev = SEV_CRITICAL
+            verdict = "this role yields credentials for lateral movement / account takeover"
+        elif read_repo or packmgr or secrets:
+            sev = SEV_HIGH
+            verdict = "this role has excessive READ (broken access control + sensitive data exposure)"
+        else:
+            sev = SEV_INFO
+            verdict = "limited access for this role"
+
+        nextstep = ""
+        if not rce and (packmgr or upload_denied):
+            nextstep = (" NEXT: package upload was denied for this role — paste a package-deploy "
+                        "role's cookies (Adobe Managed AEM: 'CPB Content Package Deployer') to "
+                        "convert this into RCE.")
+
+        self.reporter.add(Finding(
+            title=f"ACCESS SUMMARY {self._role_tag()}: " + "; ".join(caps),
+            severity=sev, category=CAT_ROLE, target=self.target,
+            evidence="; ".join(caps),
+            description=(f"Verdict: {verdict}.{nextstep} This summary aggregates the per-role "
+                         "findings above into one report-ready statement."),
+            role=self.role,
+        ))
+
     # ---- Package Manager: the primary RCE path. Try hard. ----
     def _escalate_packmgr(self) -> bool:
         ls = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
@@ -1239,7 +1304,11 @@ class AEMHunter:
         # Not executed — say exactly where it broke, so it's actionable.
         if not upload_ok:
             blocked = "UPLOAD denied — the role cannot upload packages (package service is read-only for it)"
-            nxt = "Package Manager is read-only for this role; RCE via packages is not available. Pivot to the READ-based impact (repo dump, replication creds, hashes)."
+            nxt = ("Package Manager is read-only for THIS role; package RCE needs a role with "
+                   "upload/install rights. Re-run the loop and paste the cookies of a "
+                   "package-deploy role — on Adobe Managed AEM that is 'CPB Content Package "
+                   "Deployer' (its whole purpose is installing packages = code). Otherwise the "
+                   "READ access here (full repo + secrets) is already the provable impact.")
         elif not install_ok and jsp_state == "not-written":
             blocked = "INSTALL denied — package uploaded but install did not write /apps"
             nxt = "Upload works but install/activate is blocked. Try an OSGi-bundle package dropped into /apps/<x>/install (JcrInstaller runs as system), or find a writable /apps subpath."
@@ -2380,6 +2449,12 @@ class AEMHunter:
             self.check_bundle_upload()
         except KeyboardInterrupt:
             self.logger.warn("Interrupted by user; producing report with partial findings.")
+        finally:
+            # Report-ready one-line verdict for this role, after every module ran.
+            try:
+                self._emit_access_summary()
+            except Exception as e:
+                self.logger.debug(f"access summary failed: {e}")
 
 
 # ---------------------------------------------------------------------------
