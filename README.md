@@ -108,6 +108,31 @@ runs. Each authenticated scan also probes admin-only surfaces (CRXDE, OSGi
 bundles, cloud-services tree, user/group trees, Groovy console) and flags any
 that this session can reach as a privilege-boundary violation.
 
+## Accuracy — no "shell loaded = critical" noise
+
+AEM author instances serve the **HTML/JSP shell** of consoles like CRXDE,
+Package Manager and the Felix console to *anyone* (HTTP 200), while the actual
+functionality stays behind login. Naive scanners flag that 200 as CRITICAL —
+a false positive. This tool does not:
+
+- **Login / auth-wall responses are suppressed.** A 200 that is really a login
+  page (`j_security_check`, `granite.shell.login`, `QUICKSTART`, sign-in forms,
+  auth redirects, 401/403) is never reported as access.
+- **Consoles are verified functionally, not by their shell.** A CRITICAL only
+  fires when a privileged operation actually succeeds — `bundles.json` returns
+  the live OSGi inventory, the package service returns a real package listing,
+  or a protected JCR node returns real `jcr:primaryType` JSON. If only the shell
+  renders, you get a single **INFO** note ("shell loads but no privileged
+  access — retest with role cookies"), not a critical.
+- **Data endpoints must return real JCR/JSON**, not an empty `{}` or an HTML
+  page, and severity is upgraded only when the body actually contains
+  secret-like material.
+
+So on a locked-down author instance you'll see mostly INFO — which is the
+honest answer. The real findings come from the authenticated passes: paste a
+low-privilege role's cookies and the same functional checks reveal whether that
+role can drive a console or read admin data it shouldn't.
+
 ## Reports
 
 For **every** scan (each cookie set + the unauthenticated baseline) you get:

