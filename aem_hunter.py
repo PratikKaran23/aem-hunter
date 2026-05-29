@@ -448,6 +448,7 @@ class HttpClient:
         self.verify = verify
         self.rate_limit = rate_limit
         self.logger = logger
+        self.last_error: Optional[str] = None
         self._last_request_ts = 0.0
         self._rl_lock = threading.Lock()
 
@@ -506,9 +507,13 @@ class HttpClient:
             if self.logger:
                 self.logger.debug(f"{method} {url} -> {r.status_code} ({len(r.content)} bytes)")
             return r
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
+            # Broad on purpose: a malformed cookie / oversized header / TLS issue
+            # should NOT silently kill every request with no explanation. Record
+            # the reason so the preflight + session check can surface it.
+            self.last_error = f"{e.__class__.__name__}: {e}"
             if self.logger:
-                self.logger.debug(f"{method} {url} -> ERR {e.__class__.__name__}: {e}")
+                self.logger.debug(f"{method} {url} -> ERR {self.last_error}")
             return None
 
     def get(self, path: str, **kwargs) -> Optional[requests.Response]:
@@ -2340,6 +2345,27 @@ def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
                  exploit: bool = False) -> List[str]:
     logger.section(f"SCAN: {label}")
     reporter = Reporter(logger)
+
+    # ---- Preflight WITHOUT cookies: is the target even reachable from here? ----
+    # This distinguishes "target down / IP blocked / wrong egress" from
+    # "cookies are bad". Without it, every request just returns ERR and the
+    # whole scan looks empty for no obvious reason.
+    pre = HttpClient(base_url=target, timeout=15, proxy=proxy, threads=2,
+                     verify=False, rate_limit=0.0, logger=logger)
+    rp = pre.get("/") or pre.get("/libs/granite/core/content/login.html") or pre.get("/system/console")
+    if rp is None:
+        logger.err(f"[{label}] TARGET UNREACHABLE (no cookies): {pre.last_error or 'no response'}")
+        logger.err("Every request is failing before the scan even starts. Likely causes:")
+        logger.err("  1. Network/VPN to the target is down, or the host is offline.")
+        logger.err("  2. You normally egress through Burp — pass --proxy http://127.0.0.1:8080.")
+        logger.err("  3. A WAF/IPS blocked your source IP (the aggressive --exploit run can")
+        logger.err("     trip this). Try from a different IP / wait, or confirm with:")
+        logger.err(f"        curl -k -I {target}/")
+        logger.err("Re-run with -v to see the exact per-request error. Skipping this scan.")
+        return []
+    logger.good(f"[{label}] target reachable: GET {rp.request.path_url if rp.request else '/'} "
+                f"-> HTTP {rp.status_code}")
+
     client = HttpClient(
         base_url=target, timeout=15, proxy=proxy, threads=10,
         verify=False, cookies=cookies, rate_limit=0.0, logger=logger,
@@ -2356,10 +2382,17 @@ def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
                             f"invalid/expired. Scanning anyway.")
             else:
                 logger.good(f"[{label}] authenticated as: {uid}")
+        elif who is None:
+            # Raw connectivity worked above, so a cookied request failing points
+            # at the Cookie header itself (bad char / oversized / too many).
+            logger.err(f"[{label}] connectivity is fine but the COOKIED request errored: "
+                       f"{client.last_error or 'unknown'}")
+            logger.err(f"[{label}] -> your pasted Cookie header is likely the problem "
+                       f"({len(cookies)} cookies). Check for stray characters/newlines, or "
+                       "an oversized header. Re-copy the Cookie value from DevTools.")
         else:
-            code = getattr(who, "status_code", "ERR")
             logger.warn(f"[{label}] could not confirm session via currentuser.json "
-                        f"(status {code}). Scanning anyway.")
+                        f"(HTTP {who.status_code}). Scanning anyway.")
 
     hunter = AEMHunter(
         target=target, logger=logger, reporter=reporter, client=client,
