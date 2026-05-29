@@ -46,6 +46,24 @@ Route through Burp / mitmproxy:
 python3 aem_hunter.py -u https://aem.example.com --proxy http://127.0.0.1:8080
 ```
 
+### HTTP/2-only targets
+
+Many enterprise AEM deployments sit behind a CDN/WAF/LB that **only speaks
+HTTP/2**. Python `requests` is HTTP/1.1-only, so a direct scan dies with
+`UnknownProtocol('HTTP/2')` and every request fails. Two options:
+
+- **Through Burp/mitmproxy** (`--proxy ...`) — the proxy downgrades HTTP/2 to
+  HTTP/1.1, so the default backend just works.
+- **Native HTTP/2** — no proxy needed:
+
+  ```bash
+  pip install 'httpx[http2]'
+  python3 aem_hunter.py -u https://aem.example.com --http2 -c "..."
+  ```
+
+The tool detects the HTTP/2 error and tells you which fix to use. The default
+`requests` backend is unchanged; `--http2` only switches transport when set.
+
 ### The workflow
 
 ```

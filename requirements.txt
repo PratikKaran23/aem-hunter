@@ -1,2 +1,5 @@
 requests>=2.28.0
 urllib3>=1.26.0
+# Optional — only needed for --http2 (targets that speak HTTP/2 without a
+# downgrading proxy like Burp). Safe to install; ignored unless you pass --http2.
+httpx[http2]>=0.24.0

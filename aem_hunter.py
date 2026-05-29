@@ -79,6 +79,16 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("    Install with: pip install requests urllib3\n")
     sys.exit(1)
 
+# Optional: httpx with HTTP/2 support. Many enterprise targets (behind a CDN /
+# WAF / LB) only speak HTTP/2, which `requests` cannot — those connections die
+# with UnknownProtocol('HTTP/2'). If httpx[http2] is installed, --http2 routes
+# all traffic through it so the tool works WITHOUT a downgrading proxy (Burp).
+try:
+    import httpx
+    _HAS_HTTPX = True
+except ImportError:
+    _HAS_HTTPX = False
+
 
 VERSION = "1.0.0"
 
@@ -441,6 +451,7 @@ class HttpClient:
         custom_headers: Optional[Dict[str, str]] = None,
         rate_limit: float = 0.0,
         logger: Optional[Logger] = None,
+        use_http2: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -449,6 +460,8 @@ class HttpClient:
         self.rate_limit = rate_limit
         self.logger = logger
         self.last_error: Optional[str] = None
+        self.backend = "requests"
+        self._httpx = None
         self._last_request_ts = 0.0
         self._rl_lock = threading.Lock()
 
@@ -464,11 +477,12 @@ class HttpClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
-        self.session.headers.update({
+        base_headers = {
             "User-Agent": user_agent or self.DEFAULT_UA,
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.8",
-        })
+        }
+        self.session.headers.update(base_headers)
         if custom_headers:
             self.session.headers.update(custom_headers)
         if cookies:
@@ -478,6 +492,32 @@ class HttpClient:
             self.session.auth = basic_auth
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
+
+        # Optional HTTP/2 backend via httpx (for targets requests can't speak to).
+        if use_http2 and _HAS_HTTPX:
+            try:
+                kw = dict(http2=True, verify=verify, follow_redirects=False,
+                          timeout=timeout, headers=dict(self.session.headers),
+                          cookies=cookies or {})
+                if basic_auth:
+                    kw["auth"] = basic_auth
+                if proxy:
+                    try:
+                        self._httpx = httpx.Client(proxy=proxy, **kw)        # httpx >= 0.26
+                    except TypeError:
+                        self._httpx = httpx.Client(proxies=proxy, **kw)      # older httpx
+                else:
+                    self._httpx = httpx.Client(**kw)
+                self.backend = "httpx"
+            except Exception as e:
+                self._httpx = None
+                self.backend = "requests"
+                if logger:
+                    logger.warn(f"--http2 requested but httpx HTTP/2 init failed ({e}); "
+                                "using requests. Install with: pip install 'httpx[http2]'")
+        elif use_http2 and not _HAS_HTTPX and logger:
+            logger.warn("--http2 requested but httpx is not installed. "
+                        "Install with: pip install 'httpx[http2]'  (using requests for now).")
 
     def url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
@@ -496,10 +536,12 @@ class HttpClient:
                 time.sleep(wait)
             self._last_request_ts = time.time()
 
-    def request(self, method: str, path: str, **kwargs) -> Optional[requests.Response]:
+    def request(self, method: str, path: str, **kwargs):
         self._ratelimit()
         url = self.url(path)
         kwargs.setdefault("timeout", self.timeout)
+        if self.backend == "httpx" and self._httpx is not None:
+            return self._request_httpx(method, url, **kwargs)
         kwargs.setdefault("verify", self.verify)
         kwargs.setdefault("allow_redirects", False)
         try:
@@ -511,6 +553,26 @@ class HttpClient:
             # Broad on purpose: a malformed cookie / oversized header / TLS issue
             # should NOT silently kill every request with no explanation. Record
             # the reason so the preflight + session check can surface it.
+            self.last_error = f"{e.__class__.__name__}: {e}"
+            if self.logger:
+                self.logger.debug(f"{method} {url} -> ERR {self.last_error}")
+            return None
+
+    def _request_httpx(self, method: str, url: str, **kwargs):
+        # Translate the requests-style kwargs to httpx.
+        follow = kwargs.pop("allow_redirects", False)
+        kwargs.pop("verify", None)  # set on the client
+        # requests accepts a raw string/bytes body via data=; httpx wants content=.
+        data = kwargs.get("data")
+        if isinstance(data, (str, bytes)):
+            kwargs.pop("data")
+            kwargs["content"] = data
+        try:
+            r = self._httpx.request(method, url, follow_redirects=follow, **kwargs)
+            if self.logger:
+                self.logger.debug(f"{method} {url} -> {r.status_code} ({len(r.content)} bytes) [h2={r.http_version}]")
+            return r
+        except Exception as e:
             self.last_error = f"{e.__class__.__name__}: {e}"
             if self.logger:
                 self.logger.debug(f"{method} {url} -> ERR {self.last_error}")
@@ -2467,33 +2529,44 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
 # ---------------------------------------------------------------------------
 def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
                  proxy: Optional[str], output_dir: str, logger: Logger,
-                 exploit: bool = False) -> List[str]:
+                 exploit: bool = False, use_http2: bool = False) -> List[str]:
     logger.section(f"SCAN: {label}")
     reporter = Reporter(logger)
 
     # ---- Preflight WITHOUT cookies: is the target even reachable from here? ----
-    # This distinguishes "target down / IP blocked / wrong egress" from
-    # "cookies are bad". Without it, every request just returns ERR and the
-    # whole scan looks empty for no obvious reason.
+    # This distinguishes "target down / IP blocked / wrong egress / HTTP-2-only"
+    # from "cookies are bad". Without it, every request returns ERR and the whole
+    # scan looks empty for no obvious reason.
     pre = HttpClient(base_url=target, timeout=15, proxy=proxy, threads=2,
-                     verify=False, rate_limit=0.0, logger=logger)
+                     verify=False, rate_limit=0.0, logger=logger, use_http2=use_http2)
     rp = pre.get("/") or pre.get("/libs/granite/core/content/login.html") or pre.get("/system/console")
     if rp is None:
-        logger.err(f"[{label}] TARGET UNREACHABLE (no cookies): {pre.last_error or 'no response'}")
-        logger.err("Every request is failing before the scan even starts. Likely causes:")
-        logger.err("  1. Network/VPN to the target is down, or the host is offline.")
-        logger.err("  2. You normally egress through Burp — pass --proxy http://127.0.0.1:8080.")
-        logger.err("  3. A WAF/IPS blocked your source IP (the aggressive --exploit run can")
-        logger.err("     trip this). Try from a different IP / wait, or confirm with:")
-        logger.err(f"        curl -k -I {target}/")
+        err = pre.last_error or "no response"
+        logger.err(f"[{label}] TARGET UNREACHABLE (no cookies): {err}")
+        # Most common enterprise cause: the server only speaks HTTP/2.
+        if "HTTP/2" in err or "UnknownProtocol" in err or "ProtocolError" in err:
+            logger.err("CAUSE: the target speaks HTTP/2, which Python 'requests' cannot. Fix EITHER:")
+            logger.err("  A) Route through Burp/mitmproxy (it downgrades h2->h1.1):")
+            logger.err("       --proxy http://127.0.0.1:8080        <-- you confirmed this works")
+            logger.err("  B) Use the native HTTP/2 backend (no proxy needed):")
+            logger.err("       pip install 'httpx[http2]'  then add  --http2")
+            if not _HAS_HTTPX:
+                logger.err("     (httpx is not currently installed, so --http2 needs the pip install first)")
+        else:
+            logger.err("Likely causes:")
+            logger.err("  1. Network/VPN to the target is down, or the host is offline.")
+            logger.err("  2. You normally egress through Burp — pass --proxy http://127.0.0.1:8080.")
+            logger.err("  3. A WAF/IPS blocked your source IP (the aggressive --exploit run can")
+            logger.err("     trip this). Try from a different IP / wait, or confirm with:")
+            logger.err(f"        curl -k -I {target}/")
         logger.err("Re-run with -v to see the exact per-request error. Skipping this scan.")
         return []
-    logger.good(f"[{label}] target reachable: GET {rp.request.path_url if rp.request else '/'} "
-                f"-> HTTP {rp.status_code}")
+    logger.good(f"[{label}] target reachable -> HTTP {rp.status_code} "
+                f"(backend={pre.backend}{'/h2' if pre.backend == 'httpx' else ''})")
 
     client = HttpClient(
         base_url=target, timeout=15, proxy=proxy, threads=10,
-        verify=False, cookies=cookies, rate_limit=0.0, logger=logger,
+        verify=False, cookies=cookies, rate_limit=0.0, logger=logger, use_http2=use_http2,
     )
 
     # Quick session sanity check so you know your pasted cookies actually work.
@@ -2564,6 +2637,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-u", "--url", help="Target URL (same as the positional argument)")
     p.add_argument("-c", "--cookie", help="Cookie header to use for the first scan (optional)")
     p.add_argument("--proxy", help="Route through a proxy, e.g. http://127.0.0.1:8080 (optional)")
+    p.add_argument("--http2", action="store_true",
+                   help="Use the native HTTP/2 backend (httpx) for targets that only speak "
+                        "HTTP/2. Needs: pip install 'httpx[http2]'. Avoids needing a downgrading proxy.")
     p.add_argument("-o", "--output-dir", default=".", help="Where to write reports (default: current dir)")
     p.add_argument("--exploit", action="store_true",
                    help="Enable destructive end-to-end PoCs: JSP RCE (drops+removes a canary) "
@@ -2609,6 +2685,11 @@ def main() -> int:
     logger.info(f"Target: {target}")
     if proxy:
         logger.info(f"Proxy: {proxy}")
+    if ns.http2:
+        if _HAS_HTTPX:
+            logger.info("HTTP/2 backend: ON (httpx)")
+        else:
+            logger.warn("--http2 set but httpx is not installed. Run: pip install 'httpx[http2]'")
     if ns.exploit:
         logger.warn("--exploit ON: will attempt JSP RCE PoC + admin escalation (with cleanup). "
                     "Authorized targets only.")
@@ -2656,7 +2737,7 @@ def main() -> int:
 
         try:
             all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir,
-                                            logger, exploit=ns.exploit))
+                                            logger, exploit=ns.exploit, use_http2=ns.http2))
         except KeyboardInterrupt:
             logger.warn("Scan interrupted; moving on.")
         print()
