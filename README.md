@@ -161,8 +161,14 @@ python3 aem_hunter.py -u TARGET -c "login-token=..." --exploit
 ```
 
 - Uploads + installs a content package containing a benign canary JSP, fetches
-  it to **prove end-to-end RCE**, then uninstalls + deletes everything.
-- Writes a canary JSP into `/apps` via Sling POST, executes it, then deletes it.
+  it to **prove end-to-end RCE**, then uninstalls + deletes everything. This is
+  tried across multiple service endpoints (`.json` and legacy `.jsp`,
+  `install=true` one-shot + explicit install) **even when `cmd=create` was
+  denied** — upload/install is a separate right, and package install often
+  writes `/apps` via the elevated package-manager session. If it doesn't land,
+  you get an honest `RCE NOT confirmed` (HIGH) instead of a false claim.
+- Discovers existing `/apps` child apps and tries to find any writable code
+  path, then writes a canary JSP there via Sling POST and executes it.
 - Attempts to add the current user to the `administrators` group and verifies
   membership before reporting (then you remove it manually).
 

