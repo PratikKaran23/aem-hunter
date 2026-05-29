@@ -18,44 +18,68 @@ pip install -r requirements.txt
 
 Single dependency: `requests`. Everything else is standard library.
 
-## Quick start
+## Usage
 
-Interactive mode (prompts for target, cookies, auth, output paths):
+The whole tool is just **URL + cookies**. Start it, and after every scan it
+asks you to paste the next Cookie header — so you feed it one user role after
+another and it keeps scanning. Press Enter on a blank prompt for an
+unauthenticated scan, or type `q` to quit. Every scan writes its own report.
+
+Start it (it will prompt for the URL if you don't pass one):
 
 ```bash
 python3 aem_hunter.py
+python3 aem_hunter.py https://aem.example.com
+python3 aem_hunter.py -u https://aem.example.com
 ```
 
-Non-interactive baseline scan:
+Pre-load the first role's cookies:
 
 ```bash
-python3 aem_hunter.py -u https://target.example.com
+python3 aem_hunter.py -u https://aem.example.com \
+  -c "login-token=...; cq-authoring-mode=TOUCH"
 ```
 
-Authenticated scan with a captured Cookie header:
+Route through Burp / mitmproxy:
 
 ```bash
-python3 aem_hunter.py -u https://target.example.com \
-  --cookie "login-token=...; cq-authoring-mode=TOUCH"
+python3 aem_hunter.py -u https://aem.example.com --proxy http://127.0.0.1:8080
 ```
 
-Authenticated scan with HTTP Basic auth:
+### The workflow
 
-```bash
-python3 aem_hunter.py -u https://target.example.com --basic-auth user:pass
+```
+$ python3 aem_hunter.py -u https://aem.example.com
+
+[?] Paste Cookie header (Enter=unauth, q=quit): login-token=AAA...; cq-authoring-mode=TOUCH
+[+] Loaded 2 cookie(s) -> cookie-set-1
+[+] [cookie-set-1] authenticated as: content-editor@corp
+... scan runs, report written ...
+
+[?] Paste Cookie header (Enter=unauth, q=quit): login-token=BBB...     # next role
+[+] Loaded 1 cookie(s) -> cookie-set-2
+[+] [cookie-set-2] authenticated as: cpb-deployer@corp
+... scan runs, report written ...
+
+[?] Paste Cookie header (Enter=unauth, q=quit): q
 ```
 
-Specific modules only:
+Grab the Cookie header for each role from your browser DevTools (Network tab →
+any request → Request Headers → `Cookie`) or from Burp, and paste it in when
+prompted. You can also point at a file with `@`, e.g. `@/tmp/editor-cookies.txt`.
 
-```bash
-python3 aem_hunter.py -u TARGET --modules dispatcher,querybuilder,cve
-```
+### All flags
 
-Through a Burp / mitmproxy listener:
+| Flag                 | Purpose                                            |
+| -------------------- | -------------------------------------------------- |
+| `target` / `-u`      | Target URL (positional or `-u`; prompted if absent)|
+| `-c, --cookie`       | Cookie header for the first scan (optional)        |
+| `--proxy`            | Route through a proxy (optional, e.g. Burp)        |
+| `-o, --output-dir`   | Where reports land (default: current dir)          |
+| `-v, --verbose`      | Verbose request logging                            |
 
-```bash
-python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080 --insecure
-```
+TLS verification is always off (pentest default). That's the entire surface —
+no roles to configure, no module flags.
 
 ## What it tests
 
@@ -75,31 +99,26 @@ python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080 --insecure
 | Sling POST abuse     | Arbitrary node creation, property manipulation, `:operation` and `:member` primitives             |
 | Replication          | `/etc/replication.json` and agent transport credentials                                           |
 | Source disclosure    | clientlib `.js.source` / `.source.json` quirks                                                    |
-| Auth role testing    | Walks each authenticated role over the same surfaces and diffs results                            |
+| Auth session testing | Re-runs the full battery with each pasted Cookie header + privilege-boundary checks               |
 
-## Authenticated / multi-role testing
-
-The Adobe Managed AEM role model has a fixed set of roles (Content Editor,
-Content Reviewer and Publisher, Content Viewer, Self-Content Publish Reviewer,
-CPB Site Support, CPB Content Package Deployer). Capture a Cookie header for
-each role from the browser DevTools and feed them in:
-
-```bash
-python3 aem_hunter.py -u TARGET \
-  --cookie-role "content-editor:login-token=...; cq-..." \
-  --cookie-role "cpb-deployer:login-token=..."
-```
-
-Or use interactive mode and add roles one at a time when prompted.
+When you paste a Cookie header, the tool first hits
+`/libs/granite/security/currentuser.json` and prints who you authenticated as,
+so you immediately know whether the session is valid or expired before the scan
+runs. Each authenticated scan also probes admin-only surfaces (CRXDE, OSGi
+bundles, cloud-services tree, user/group trees, Groovy console) and flags any
+that this session can reach as a privilege-boundary violation.
 
 ## Reports
 
-Three outputs every run:
+For **every** scan (each cookie set + the unauthenticated baseline) you get:
 
-- live console with severity tags
-- `report-<host>-<ts>.json` – machine readable findings
-- `report-<host>-<ts>.html` – styled report with evidence, request/response
-  snippets, references and CVE badges
+- live console output with severity tags
+- `report-<host>-<scan>-<ts>.json` – machine readable findings
+- `report-<host>-<scan>-<ts>.html` – styled report with evidence,
+  request/response snippets, references and CVE badges
+
+The HTML uses inline CSS, so it renders fine on an air-gapped box with no
+internet access. Reports are git-ignored so findings never get committed.
 
 ## References
 

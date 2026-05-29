@@ -31,8 +31,18 @@ Covers:
     `:operation`/`:member` primitives)
   - Replication agent transport credential disclosure
   - Source / clientlib disclosure tricks
-  - Authenticated, role-based probing (Content Editor, CPB Deployer, etc.)
+  - Authenticated probing with any session cookies you paste
   - Three-channel reporting: live console, JSON, HTML
+
+Usage is dead simple:
+    python3 aem_hunter.py                         # prompts for the URL
+    python3 aem_hunter.py https://aem.example.com
+    python3 aem_hunter.py -u TARGET -c "login-token=...; cq-authoring-mode=TOUCH"
+
+After each scan finishes you are prompted to paste the next Cookie header
+(e.g. the next user role). It keeps scanning with whatever you paste. Press
+Enter on an empty prompt for an unauthenticated scan, or type q to quit.
+Every scan writes its own JSON + HTML report.
 
 Author: pentest use only.  Authorization required.
 """
@@ -465,10 +475,13 @@ class HttpClient:
         self._rl_lock = threading.Lock()
 
         self.session = requests.Session()
+        # Fail fast on dead/unreachable hosts (connect=0); only retry transient
+        # 5xx from upstream once. Keeps scans snappy against firewalled paths.
         adapter = HTTPAdapter(
             pool_connections=max(threads * 2, 10),
             pool_maxsize=max(threads * 2, 10),
-            max_retries=Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504]),
+            max_retries=Retry(total=1, connect=0, read=0, backoff_factor=0.2,
+                              status_forcelist=[502, 503, 504]),
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -1421,7 +1434,7 @@ class AEMHunter:
     def check_authenticated_role(self) -> None:
         if not self._enabled("role") or not self.role:
             return
-        self.logger.section(f"Authenticated role probe ({self.role})")
+        self.logger.section(f"Authenticated probe [{self.role}]")
 
         # 15a — fetch CSRF token
         self.fetch_csrf_token()
@@ -1431,7 +1444,7 @@ class AEMHunter:
         if r is not None and r.status_code == 200:
             body = safe_response_text(r, 2000)
             self.reporter.add(Finding(
-                title=f"Role '{self.role}' authenticated as: see evidence",
+                title=f"[{self.role}] authenticated identity (see evidence)",
                 severity=SEV_INFO, category=CAT_ROLE,
                 target=self.target + "/libs/granite/security/currentuser.json",
                 evidence=snippet(body, 400),
@@ -1462,12 +1475,12 @@ class AEMHunter:
                 if "j_username" in body.lower() or "please log in" in body.lower():
                     continue
                 self.reporter.add(Finding(
-                    title=f"Role '{self.role}' can reach admin surface: {label}",
+                    title=f"[{self.role}] can reach admin surface: {label}",
                     severity=sev, category=CAT_ROLE,
                     target=self.target + path,
                     evidence=f"HTTP 200 with {len(r.content)} bytes",
-                    description=(f"Role '{self.role}' should not be able to view {label}. "
-                                 "Privilege boundary violation — flag for the team."),
+                    description=(f"This authenticated session should not be able to view "
+                                 f"{label}. Privilege boundary violation — flag for the team."),
                     request=self.client.request_signature("GET", path),
                     response_snippet=snippet(body, 600),
                     role=self.role,
@@ -1482,7 +1495,7 @@ class AEMHunter:
                 body = safe_response_text(r, 500)
                 if "error" not in body.lower():
                     self.reporter.add(Finding(
-                        title=f"Role '{self.role}' may be able to escalate via :member=",
+                        title=f"[{self.role}] may be able to escalate via :member=",
                         severity=SEV_CRITICAL, category=CAT_ROLE,
                         target=self.target + "/home/users/a/admin.rw.html",
                         evidence=f"POST accepted with status {r.status_code}",
@@ -1507,7 +1520,7 @@ class AEMHunter:
             # The console returning 302 to login is benign; only 200 is interesting
             if r.status_code == 200 and "Felix" in (r.text or ""):
                 self.reporter.add(Finding(
-                    title=f"Role '{self.role}' can POST to /system/console/bundles",
+                    title=f"[{self.role}] can POST to /system/console/bundles",
                     severity=SEV_CRITICAL, category=CAT_ROLE,
                     target=self.target + "/system/console/bundles",
                     evidence="POST returned 200 with Felix body.",
@@ -1650,7 +1663,7 @@ def render_html_report(target: str, findings: List[Finding], summary: Dict[str, 
                 for r in f.references) + "</div>"
         cve_badge = (f'<span class="badge b-cve">{html_mod.escape(f.cve)}</span>'
                      if f.cve else "")
-        role_badge = (f'<span class="badge b-role">role: {html_mod.escape(f.role)}</span>'
+        role_badge = (f'<span class="badge b-role">{html_mod.escape(f.role)}</span>'
                       if f.role else "")
         req_block = (f'<div class="meta">Request</div><pre>{html_mod.escape(f.request)}</pre>'
                      if f.request else "")
@@ -1695,95 +1708,17 @@ def render_html_report(target: str, findings: List[Finding], summary: Dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Interactive prompts
-# ---------------------------------------------------------------------------
-def prompt(text: str, default: Optional[str] = None) -> str:
-    suffix = f" [{default}]" if default else ""
-    try:
-        val = input(f"{text}{suffix}: ").strip()
-    except EOFError:
-        return default or ""
-    return val or (default or "")
-
-
-def prompt_yes_no(text: str, default: bool = False) -> bool:
-    yn = "Y/n" if default else "y/N"
-    val = prompt(f"{text} ({yn})").lower()
-    if not val:
-        return default
-    return val.startswith("y")
-
-
-def interactive_setup() -> Dict[str, Any]:
-    print(BANNER.format(ver=VERSION))
-    print("Interactive mode. Press Enter to accept defaults.\n")
-
-    target = ""
-    while not target:
-        target = prompt("Target URL (e.g. https://aem.example.com)")
-    target = normalize_target(target)
-
-    use_cookies = prompt_yes_no("Do you have an authenticated session to test with?",
-                                default=False)
-    cookie_specs: List[Tuple[Optional[str], Dict[str, str]]] = []
-    if use_cookies:
-        print("\nFor each role, paste the full Cookie header value or an absolute "
-              "path to a file containing it. Leave blank to stop.\n")
-        while True:
-            role = prompt("  Role label (or blank to finish)").strip()
-            if not role:
-                break
-            raw = prompt("  Cookie header (or @/path/to/file)").strip()
-            if raw.startswith("@"):
-                try:
-                    with open(raw[1:], "r") as fh:
-                        raw = fh.read().strip()
-                except OSError as e:
-                    print(f"  ! Could not read file: {e}")
-                    continue
-            cookies = parse_cookie_string(raw)
-            if not cookies:
-                print("  ! No cookies parsed; skipping.")
-                continue
-            cookie_specs.append((role, cookies))
-            print(f"  + Added role '{role}' with {len(cookies)} cookies.\n")
-
-    basic_auth_raw = prompt("HTTP Basic auth (user:pass) or blank")
-    basic_auth = parse_basic_auth(basic_auth_raw) if basic_auth_raw else None
-
-    proxy = prompt("Outbound proxy (e.g. http://127.0.0.1:8080) or blank")
-    threads_str = prompt("Concurrent threads", "10")
-    try:
-        threads = max(1, int(threads_str))
-    except ValueError:
-        threads = 10
-
-    aggression = prompt("Fuzz aggression [quick/normal/aggressive]", "normal").lower()
-    if aggression not in ("quick", "normal", "aggressive"):
-        aggression = "normal"
-
-    output_dir = prompt("Output directory", ".")
-
-    return {
-        "target": target,
-        "cookie_specs": cookie_specs,
-        "basic_auth": basic_auth,
-        "proxy": proxy or None,
-        "threads": threads,
-        "aggression": aggression,
-        "output_dir": output_dir,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Reporting outputs
 # ---------------------------------------------------------------------------
 def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
-                  output_dir: str, logger: Logger) -> None:
+                  output_dir: str, logger: Logger, label: Optional[str] = None) -> List[str]:
     os.makedirs(output_dir, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     host = short_host(target)
-    base = os.path.join(output_dir, f"report-{host}-{ts}")
+    lbl = ""
+    if label:
+        lbl = "-" + re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    base = os.path.join(output_dir, f"report-{host}{lbl}-{ts}")
     json_path = base + ".json"
     html_path = base + ".html"
 
@@ -1792,6 +1727,7 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
             "tool": "aem-hunter",
             "version": VERSION,
             "target": target,
+            "scan": label or "unauthenticated",
             "generated": dt.datetime.now().isoformat(timespec="seconds"),
             "summary": summary,
             "findings": [asdict(f) for f in findings],
@@ -1801,201 +1737,173 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
     with open(html_path, "w") as fh:
         fh.write(render_html_report(target, findings, summary))
     logger.good(f"HTML report: {html_path}")
+    return [json_path, html_path]
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# One scan = one cookie set (or none). Each scan writes its own report.
 # ---------------------------------------------------------------------------
-ALL_MODULES = {
-    "creds", "exposure", "dispatcher", "sling", "querybuilder",
-    "groovy", "ssrf", "xxe", "cve", "slingpost", "source", "misc",
-    "role", "bundle",
-}
+def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
+                 proxy: Optional[str], output_dir: str, logger: Logger) -> List[str]:
+    logger.section(f"SCAN: {label}")
+    reporter = Reporter(logger)
+    client = HttpClient(
+        base_url=target, timeout=15, proxy=proxy, threads=10,
+        verify=False, cookies=cookies, rate_limit=0.0, logger=logger,
+    )
+
+    # Quick session sanity check so you know your pasted cookies actually work.
+    if cookies:
+        who = client.get("/libs/granite/security/currentuser.json")
+        if who is not None and who.status_code == 200:
+            m = re.search(r'"(?:userID|authorizableId|id)"\s*:\s*"([^"]+)"', who.text or "")
+            uid = m.group(1) if m else "?"
+            if uid.lower() == "anonymous":
+                logger.warn(f"[{label}] cookies resolve to ANONYMOUS — session looks "
+                            f"invalid/expired. Scanning anyway.")
+            else:
+                logger.good(f"[{label}] authenticated as: {uid}")
+        else:
+            code = getattr(who, "status_code", "ERR")
+            logger.warn(f"[{label}] could not confirm session via currentuser.json "
+                        f"(status {code}). Scanning anyway.")
+
+    hunter = AEMHunter(
+        target=target, logger=logger, reporter=reporter, client=client,
+        threads=10, role=(label if cookies else None),
+        enable_modules=None, fuzz_aggression="normal",
+    )
+    hunter.run()
+
+    summary = reporter.summary()
+    logger.section(f"Summary [{label}]")
+    for sev in (SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM, SEV_LOW, SEV_INFO):
+        logger.finding(sev, f"{summary.get(sev, 0)} {sev}")
+    return write_reports(target, reporter.by_severity(), summary, output_dir, logger, label=label)
 
 
+# ---------------------------------------------------------------------------
+# CLI — minimal: URL + cookie. Everything else is optional with sane defaults.
+# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="aem_hunter.py",
-        description="Adobe Experience Manager offensive audit tool. "
-                    "Single-file scanner for authorized testing.",
+        description="Adobe Experience Manager audit tool. Paste cookies, scan, repeat.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
               python3 aem_hunter.py
-              python3 aem_hunter.py -u https://target.example.com
-              python3 aem_hunter.py -u TARGET --cookie "login-token=...; cq-..."
-              python3 aem_hunter.py -u TARGET --basic-auth admin:admin
-              python3 aem_hunter.py -u TARGET --modules dispatcher,querybuilder,cve
-              python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080 -k
+              python3 aem_hunter.py https://aem.example.com
+              python3 aem_hunter.py -u https://aem.example.com -c "login-token=...; cq-authoring-mode=TOUCH"
+              python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080
+
+            After each scan finishes you are prompted to paste the next Cookie
+            header (the next user role). It keeps scanning with whatever you
+            paste. Press Enter on an empty prompt for an unauthenticated scan,
+            or type q to quit. Every scan writes its own JSON + HTML report.
             """),
     )
-    p.add_argument("-u", "--url", help="Target base URL (e.g. https://aem.example.com)")
-    p.add_argument("--cookie", action="append", default=[],
-                   help="Cookie header value (can be repeated)")
-    p.add_argument("--cookie-role", action="append", default=[],
-                   help="Per-role cookies as 'role-label:cookie-string'. Repeat per role.")
-    p.add_argument("--cookie-file", action="append", default=[],
-                   help="Path to a file containing the Cookie header (repeatable).")
-    p.add_argument("--basic-auth", help="HTTP Basic auth, user:pass")
-    p.add_argument("--header", action="append", default=[],
-                   help="Custom header 'Name: value' (repeatable)")
-    p.add_argument("--proxy", help="Outbound proxy URL (http://host:port)")
-    p.add_argument("-k", "--insecure", action="store_true", help="Disable TLS verification")
-    p.add_argument("-t", "--threads", type=int, default=10, help="Concurrent threads (default 10)")
-    p.add_argument("--timeout", type=int, default=15, help="Per-request timeout in seconds")
-    p.add_argument("--rate-limit", type=float, default=0.0,
-                   help="Max requests per second (0 = unlimited)")
-    p.add_argument("--modules", help=f"Comma-separated module subset (any of: {','.join(sorted(ALL_MODULES))})")
-    p.add_argument("--aggression", choices=("quick", "normal", "aggressive"), default="normal",
-                   help="Fuzzing aggression for dispatcher / selector probes")
-    p.add_argument("-o", "--output-dir", default=".", help="Where to write JSON / HTML reports")
-    p.add_argument("--user-agent", help="Override the User-Agent header")
-    p.add_argument("-v", "--verbose", action="store_true", help="Verbose debug output")
-    p.add_argument("--no-color", action="store_true", help="Disable ANSI colour output")
-    p.add_argument("--no-interactive", action="store_true",
-                   help="Skip interactive prompts even if target/cookies missing")
+    p.add_argument("target", nargs="?", help="Target URL (e.g. https://aem.example.com)")
+    p.add_argument("-u", "--url", help="Target URL (same as the positional argument)")
+    p.add_argument("-c", "--cookie", help="Cookie header to use for the first scan (optional)")
+    p.add_argument("--proxy", help="Route through a proxy, e.g. http://127.0.0.1:8080 (optional)")
+    p.add_argument("-o", "--output-dir", default=".", help="Where to write reports (default: current dir)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     p.add_argument("--version", action="version", version=f"aem-hunter {VERSION}")
     return p.parse_args()
 
 
-def build_cookie_specs_from_args(ns: argparse.Namespace) -> List[Tuple[Optional[str], Dict[str, str]]]:
-    out: List[Tuple[Optional[str], Dict[str, str]]] = []
-    for c in ns.cookie:
-        cookies = parse_cookie_string(c)
-        if cookies:
-            out.append((None, cookies))
-    for cf_path in ns.cookie_file:
+def _read_cookie_input(raw: str, logger: Logger) -> Optional[str]:
+    """Resolve an '@/path/to/file' reference, else return the string as-is."""
+    if raw.startswith("@"):
+        path = raw[1:].strip()
         try:
-            with open(cf_path, "r") as fh:
-                raw = fh.read().strip()
-                cookies = parse_cookie_string(raw)
-                if cookies:
-                    out.append((None, cookies))
+            with open(path, "r") as fh:
+                return fh.read().strip()
         except OSError as e:
-            sys.stderr.write(f"[!] Could not read cookie file {cf_path}: {e}\n")
-    for entry in ns.cookie_role:
-        if ":" not in entry:
-            sys.stderr.write(f"[!] --cookie-role expects 'role:cookie-string', got {entry!r}\n")
-            continue
-        role, raw = entry.split(":", 1)
-        cookies = parse_cookie_string(raw)
-        if cookies:
-            out.append((role.strip() or None, cookies))
-    return out
+            logger.err(f"Could not read cookie file {path}: {e}")
+            return None
+    return raw
 
 
 def main() -> int:
     ns = parse_args()
-    logger = Logger(verbose=ns.verbose, no_color=ns.no_color)
-
+    logger = Logger(verbose=ns.verbose)
     print(BANNER.format(ver=VERSION))
 
-    # Interactive vs. CLI flow
-    if not ns.url and not ns.no_interactive:
-        cfg = interactive_setup()
-        target = cfg["target"]
-        cookie_specs = cfg["cookie_specs"]
-        basic_auth = cfg["basic_auth"]
-        proxy = cfg["proxy"]
-        threads = cfg["threads"]
-        aggression = cfg["aggression"]
-        output_dir = cfg["output_dir"]
-        custom_headers: Dict[str, str] = {}
-        insecure = True
-        timeout = 15
-        rate_limit = 0.0
-        user_agent = None
-        enable_modules = None
-    else:
-        if not ns.url:
-            logger.err("Missing target URL (--url). Use interactive mode or pass --url.")
-            return 2
-        target = normalize_target(ns.url)
-        cookie_specs = build_cookie_specs_from_args(ns)
-        basic_auth = parse_basic_auth(ns.basic_auth) if ns.basic_auth else None
-        proxy = ns.proxy
-        threads = ns.threads
-        aggression = ns.aggression
-        output_dir = ns.output_dir
-        custom_headers = {}
-        for h in ns.header:
-            if ":" in h:
-                k, v = h.split(":", 1)
-                custom_headers[k.strip()] = v.strip()
-        insecure = ns.insecure or True  # default to skip TLS verify in pentest context
-        timeout = ns.timeout
-        rate_limit = ns.rate_limit
-        user_agent = ns.user_agent
-        enable_modules = None
-        if ns.modules:
-            chosen = {m.strip() for m in ns.modules.split(",") if m.strip()}
-            unknown = chosen - ALL_MODULES
-            if unknown:
-                logger.err(f"Unknown modules: {sorted(unknown)}. Available: {sorted(ALL_MODULES)}")
-                return 2
-            enable_modules = chosen
+    target = ns.url or ns.target
+    if not target:
+        try:
+            target = input("Target URL (e.g. https://aem.example.com): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+    if not target:
+        logger.err("No target URL provided.")
+        return 2
+    target = normalize_target(target)
+
+    proxy = ns.proxy
+    output_dir = ns.output_dir or "."
 
     logger.info(f"Target: {target}")
-    logger.info(f"Threads: {threads} | Aggression: {aggression} | Modules: "
-                f"{'all' if enable_modules is None else ','.join(sorted(enable_modules))}")
     if proxy:
         logger.info(f"Proxy: {proxy}")
-    if basic_auth:
-        logger.info(f"Basic auth: {basic_auth[0]}:***")
-    if cookie_specs:
-        logger.info(f"Authenticated roles to test: {len(cookie_specs)}")
+    print()
+    logger.info("How this works:")
+    logger.info("  - Paste a Cookie header + Enter  -> authenticated scan with those cookies")
+    logger.info("  - Just press Enter (blank)       -> unauthenticated scan")
+    logger.info("  - Prefix with @ to read a file   -> e.g.  @/tmp/editor.txt")
+    logger.info("  - Type q + Enter (or Ctrl-C)     -> finish and exit")
+    print()
 
-    reporter = Reporter(logger)
+    all_reports: List[str] = []
+    n_auth = 0
+    pending = ns.cookie  # use --cookie for the very first scan if given
 
-    # ---- Unauthenticated pass ----
-    logger.section("=== UNAUTHENTICATED PASS ===")
-    unauth_client = HttpClient(
-        base_url=target, timeout=timeout, proxy=proxy, threads=threads,
-        verify=not insecure, user_agent=user_agent,
-        custom_headers=custom_headers or None,
-        basic_auth=basic_auth, rate_limit=rate_limit, logger=logger,
-    )
-    hunter = AEMHunter(
-        target=target, logger=logger, reporter=reporter,
-        client=unauth_client, threads=threads, role=None,
-        enable_modules=enable_modules, fuzz_aggression=aggression,
-    )
-    hunter.run()
+    while True:
+        if pending is not None:
+            raw = pending.strip()
+            pending = None
+            logger.info("Using cookies from --cookie for this scan.")
+        else:
+            try:
+                raw = input("[?] Paste Cookie header (Enter=unauth, q=quit): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
-    # ---- Authenticated passes per role ----
-    for role, cookies in cookie_specs:
-        label = role or "session"
-        logger.section(f"=== AUTHENTICATED PASS ({label}) ===")
-        auth_client = HttpClient(
-            base_url=target, timeout=timeout, proxy=proxy, threads=threads,
-            verify=not insecure, user_agent=user_agent, cookies=cookies,
-            custom_headers=custom_headers or None,
-            basic_auth=basic_auth, rate_limit=rate_limit, logger=logger,
-        )
-        role_hunter = AEMHunter(
-            target=target, logger=logger, reporter=reporter,
-            client=auth_client, threads=threads, role=label,
-            enable_modules=enable_modules, fuzz_aggression=aggression,
-        )
-        role_hunter.run()
+        if raw.lower() in ("q", "quit", "exit"):
+            break
 
-    # ---- Summary + reports ----
-    summary = reporter.summary()
-    logger.section("Summary")
-    for sev in (SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM, SEV_LOW, SEV_INFO):
-        logger.finding(sev, f"{summary.get(sev, 0)} {sev} findings")
+        if raw:
+            resolved = _read_cookie_input(raw, logger)
+            if resolved is None:
+                continue
+            cookies = parse_cookie_string(resolved)
+            if not cookies:
+                logger.err("Could not parse any cookies from that input. Try again.")
+                continue
+            n_auth += 1
+            label = f"cookie-set-{n_auth}"
+            logger.good(f"Loaded {len(cookies)} cookie(s) -> {label}")
+        else:
+            cookies = None
+            label = "unauthenticated"
 
-    write_reports(target, reporter.by_severity(), summary, output_dir, logger)
+        try:
+            all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir, logger))
+        except KeyboardInterrupt:
+            logger.warn("Scan interrupted; moving on.")
+        print()
+        logger.info("Scan complete. Paste the next role's cookies, or q to quit.")
 
-    # Exit code reflects severity ceiling for CI use
-    if summary.get(SEV_CRITICAL, 0) > 0:
-        return 4
-    if summary.get(SEV_HIGH, 0) > 0:
-        return 3
-    if summary.get(SEV_MEDIUM, 0) > 0:
-        return 2
-    if summary.get(SEV_LOW, 0) > 0:
-        return 1
+    if all_reports:
+        logger.section("Reports written this session")
+        for pth in all_reports:
+            logger.good(pth)
+    else:
+        logger.warn("No scans were run.")
     return 0
 
 
