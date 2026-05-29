@@ -3345,6 +3345,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("target", nargs="?", help="Target URL (e.g. https://aem.example.com)")
     p.add_argument("-u", "--url", help="Target URL (same as the positional argument)")
     p.add_argument("-c", "--cookie", help="Cookie header to use for the first scan (optional)")
+    p.add_argument("--cookies-dir", metavar="DIR", nargs="?", const="cookies",
+                   help="Per-role cookie store. Point at a folder of '<role>.txt' files (each "
+                        "containing that role's Cookie header) and the tool scans one per role, "
+                        "labelling reports by filename. If the folder is empty it asks you for "
+                        "each role's cookies and saves the files itself. Default folder: ./cookies")
     p.add_argument("--proxy", help="Route through a proxy, e.g. http://127.0.0.1:8080 (optional)")
     p.add_argument("--http2", action="store_true",
                    help="Use the native HTTP/2 backend (httpx) for targets that only speak "
@@ -3378,6 +3383,80 @@ def _read_cookie_input(raw: str, logger: Logger) -> Optional[str]:
             logger.err(f"Could not read cookie file {path}: {e}")
             return None
     return raw
+
+
+def _role_label_from_filename(fname: str) -> str:
+    stem = os.path.splitext(os.path.basename(fname))[0]
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", stem).strip("-") or "role"
+
+
+def _collect_cookies_interactively(cdir: str, logger: Logger) -> List[Tuple[str, Dict[str, str]]]:
+    """Prompt role-by-role, save each to <cdir>/<role>.txt, return [(label, cookies)]."""
+    out: List[Tuple[str, Dict[str, str]]] = []
+    logger.info("Enter each role's cookies. Blank role name finishes.")
+    while True:
+        try:
+            name = input("[?] Role name (e.g. cpb-deployer; blank to finish): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not name:
+            break
+        label = re.sub(r"[^a-zA-Z0-9_-]+", "-", name.lower()).strip("-") or "role"
+        try:
+            raw = input(f"[?] Paste Cookie header for '{label}' (or @file): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        resolved = _read_cookie_input(raw, logger) if raw else None
+        cookies = parse_cookie_string(resolved) if resolved else None
+        if not cookies:
+            logger.err("  No cookies parsed; skipping this role.")
+            continue
+        path = os.path.join(cdir, label + ".txt")
+        try:
+            with open(path, "w") as fh:
+                fh.write(resolved.strip() + "\n")
+            logger.good(f"  Saved {path} ({len(cookies)} cookie(s))")
+        except OSError as e:
+            logger.err(f"  Could not write {path}: {e}")
+        out.append((label, cookies))
+    return out
+
+
+def load_or_collect_cookies(cdir: str, logger: Logger) -> List[Tuple[str, Dict[str, str]]]:
+    """Option A: load every <role>.txt already in cdir. Option B: if empty, collect
+    them interactively and save the files. Returns [(label, cookies_dict), ...]."""
+    os.makedirs(cdir, exist_ok=True)
+    files = sorted(f for f in os.listdir(cdir) if f.lower().endswith((".txt", ".cookie", ".cookies")))
+    roles: List[Tuple[str, Dict[str, str]]] = []
+    if files:
+        logger.good(f"Loaded {len(files)} cookie file(s) from {cdir}/:")
+        for f in files:
+            label = _role_label_from_filename(f)
+            try:
+                with open(os.path.join(cdir, f)) as fh:
+                    raw = fh.read().strip()
+            except OSError as e:
+                logger.err(f"  ! {f}: {e}")
+                continue
+            cookies = parse_cookie_string(raw)
+            if cookies:
+                roles.append((label, cookies))
+                logger.info(f"  + {label}  ({len(cookies)} cookie(s))")
+            else:
+                logger.warn(f"  ! {f}: no cookies parsed, skipping")
+        try:
+            more = input("[?] Add more roles interactively? (y/N): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            more = "n"
+        if more.startswith("y"):
+            roles += _collect_cookies_interactively(cdir, logger)
+    else:
+        logger.info(f"No cookie files in {cdir}/ yet — collecting them now "
+                    "(they'll be saved for next time).")
+        roles = _collect_cookies_interactively(cdir, logger)
+    return roles
 
 
 def main() -> int:
@@ -3430,6 +3509,28 @@ def main() -> int:
         else:
             logger.info(f"OOB SSRF callback: http://{ssrf_callback}/ (target must reach this)")
     print()
+
+    # ---- Cookie-store mode: one report per saved <role>.txt (load or collect) ----
+    if ns.cookies_dir is not None:
+        roles = load_or_collect_cookies(ns.cookies_dir, logger)
+        all_reports: List[str] = []
+        # unauthenticated baseline first, then one scan per role file
+        for label, cookies in [("unauthenticated", None)] + roles:
+            try:
+                all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir,
+                                                logger, exploit=ns.exploit, use_http2=ns.http2,
+                                                ssrf_callback=ssrf_callback,
+                                                ssrf_collaborator=ssrf_collaborator))
+            except KeyboardInterrupt:
+                logger.warn("Scan interrupted; moving on to the next role.")
+        if all_reports:
+            logger.section("Reports written this session")
+            for pth in all_reports:
+                logger.good(pth)
+        else:
+            logger.warn("No scans were run (no role cookies provided).")
+        return 0
+
     logger.info("How this works:")
     logger.info("  - Paste a Cookie header + Enter  -> authenticated scan with those cookies")
     logger.info("  - Just press Enter (blank)       -> unauthenticated scan")

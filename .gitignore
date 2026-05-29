@@ -14,3 +14,7 @@ report-*.json
 aem-hunter-*.log
 findings/
 *.bak
+# Per-role cookie store (session tokens — never commit)
+cookies/
+*.cookie
+*.cookies

@@ -86,6 +86,36 @@ Grab the Cookie header for each role from your browser DevTools (Network tab →
 any request → Request Headers → `Cookie`) or from Burp, and paste it in when
 prompted. You can also point at a file with `@`, e.g. `@/tmp/editor-cookies.txt`.
 
+### Per-role cookie store (`--cookies-dir`)
+
+For multi-role testing, use a cookie store so you don't re-paste every run. Two
+ways, both via `--cookies-dir`:
+
+**A — pre-save a file per role** (one Cookie header per file, filename = role):
+
+```
+cookies/
+  content-editor.txt
+  cpb-deployer.txt
+  content-reviewer-publisher.txt
+```
+```bash
+python3 aem_hunter.py -u TARGET --proxy http://127.0.0.1:8080 --cookies-dir cookies --exploit
+```
+The tool loads every `<role>.txt`, runs an unauthenticated baseline, then one
+scan per role, naming each report after the file
+(`report-<host>-cpb-deployer-<ts>.html`).
+
+**B — let the tool collect them** (empty/missing folder): it asks for each
+role's name + cookie, saves `cookies/<role>.txt` itself, then scans — and on the
+next run those files are auto-loaded (mode A).
+
+```bash
+python3 aem_hunter.py -u TARGET --cookies-dir   # defaults to ./cookies
+```
+
+The `cookies/` folder is git-ignored (it holds live session tokens).
+
 ### All flags
 
 | Flag                 | Purpose                                            |
