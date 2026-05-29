@@ -133,6 +133,43 @@ honest answer. The real findings come from the authenticated passes: paste a
 low-privilege role's cookies and the same functional checks reveal whether that
 role can drive a console or read admin data it shouldn't.
 
+## Active escalation — confirm it's real, then prove impact
+
+When a primitive is found (Package Manager reachable, CRX DavEx readable, JCR
+readable), the escalation module automatically tries to turn it into proof.
+It distinguishes **intended read-only behaviour** from **real exploitability**:
+
+Safe-confirm tier (runs by default, fully reversible):
+
+- **Package Manager** → creates a throwaway empty package, confirms success,
+  deletes it. If it works → this session can create/build/install packages,
+  and package install = code execution. CRITICAL.
+- **CRX DavEx** → `MKCOL`s a throwaway collection under `/tmp`, then `DELETE`s
+  it. Proves arbitrary JCR write over WebDAV.
+- **Sling POST** → creates then deletes a node under `/apps`, `/var`,
+  `/content`, `/etc`, `/conf`, `/tmp`. A writable `/apps` (code space) is
+  flagged CRITICAL — that's a direct path to RCE.
+- **Secret harvesting** → pulls readable trees and extracts every
+  password / key / token. Encrypted `{...}` values are flagged HIGH (note: a
+  readable `/etc/key` master key lets you decrypt them offline); plaintext
+  secrets are CRITICAL.
+
+Exploit tier (only with `--exploit`, drops & removes artifacts):
+
+```bash
+python3 aem_hunter.py -u TARGET -c "login-token=..." --exploit
+```
+
+- Uploads + installs a content package containing a benign canary JSP, fetches
+  it to **prove end-to-end RCE**, then uninstalls + deletes everything.
+- Writes a canary JSP into `/apps` via Sling POST, executes it, then deletes it.
+- Attempts to add the current user to the `administrators` group and verifies
+  membership before reporting (then you remove it manually).
+
+The canary JSP only prints `System.getProperty("user.name")` — it proves Java
+code execution without running OS commands. Everything created is cleaned up.
+Use `--exploit` only on targets you're authorized to actively exploit.
+
 ## Reports
 
 For **every** scan (each cookie set + the unauthenticated baseline) you get:

