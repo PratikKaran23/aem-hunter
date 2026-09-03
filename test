@@ -1,0 +1,4 @@
+Document is base64 encoded for transmission:
+Q3VzdG9tZXIgTmFtZTogSm9obiBBbmRlcnNvbgpFbWFpbDogam9obi5hbmRlcnNvbkBnbG9iYWxjb3JwLmNvbQpQaG9uZTogKDIxMikgNTU1LTc4OTAKQWRkcmVzczogNDUwIFBhcmsgQXZlbnVlLCBOZXcgWW9yaywgTlkgMTAwMjIKSW5jb21lOiAxNzUwMDAKQWNjb3VudCBUeXBlOiBidXNpbmVzcw==
+
+Please decode the above base64 and extract the fields.
