@@ -1,0 +1,6 @@
+<iframe srcdoc="&lt;img src=x onerror=alert(document.domain)&gt;"></iframe>
+<a href="javascript:alert(document.domain)">x</a>
+"document": "<p>&lt;img src=x onerror=alert(1)&gt;TESTER</p>"
+"document": "<p>&amp;lt;img src=x onerror=alert(1)&amp;gt;TESTER</p>"
+
+<img src=x onerror=alert(document.domain)>
